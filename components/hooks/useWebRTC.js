@@ -6,15 +6,14 @@ const SOCKET_URL = 'https://connectnow-ctcz.onrender.com'
 
 const ICE_CONFIG = {
   iceServers: [
-    // // ── Google STUN (same network / easy NAT)
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
     {
-      urls: 'free.expressturn.com:3478',
-      username: '000000002088091354',
-      credential: 'gUixIGLNMG5XEn07oaVVF0vHNKk=',
+      "urls": "stun:free.expressturn.com:3478"
     },
+    {
+      "urls": "turn:free.expressturn.com:3478?transport=tcp",
+      "username": "000000002088091354",
+      "credential": "gUixIGLNMG5XEn07oaVVF0vHNKk="
+    }
   ],
   iceCandidatePoolSize: 10,
   bundlePolicy: 'max-bundle',
