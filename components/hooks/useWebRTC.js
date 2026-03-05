@@ -6,63 +6,25 @@ const SOCKET_URL = 'https://connectnow-ctcz.onrender.com'
 
 const ICE_CONFIG = {
   iceServers: [
-    // ── Google STUN (same network / easy NAT)
-    { urls: 'stun:stun.l.google.com:19302'  },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
-
-    // ── freestun — NO SIGNUP, totally free
-    { urls: 'stun:freestun.net:3478' },
+    // // ── Google STUN (same network / easy NAT)
+    // { urls: 'stun:stun.l.google.com:19302' },
+    // { urls: 'stun:stun1.l.google.com:19302' },
+    // { urls: 'stun:stun2.l.google.com:19302' },
     {
-      urls:       'turn:freestun.net:3478',
-      username:   'free',
-      credential: 'free',
-    },
-    {
-      urls:       'turn:freestun.net:3479',
-      username:   'free',
-      credential: 'free',
-    },
-    // ── freestun TURNS (SSL — bypasses deep packet inspection)
-    {
-      urls:       'turns:freestun.net:5349',
-      username:   'free',
-      credential: 'free',
-    },
-
-    // ── OpenRelay (Metered) — 20GB/mo free, port 80+443
-    {
-      urls:       'turn:openrelay.metered.ca:80',
-      username:   'openrelayproject',
-      credential: 'openrelayproject',
-    },
-    {
-      urls:       'turn:openrelay.metered.ca:443',
-      username:   'openrelayproject',
-      credential: 'openrelayproject',
-    },
-    // ── OpenRelay TURNS — SSL port 443 bypasses all firewalls
-    {
-      urls:       'turns:openrelay.metered.ca:443',
-      username:   'openrelayproject',
-      credential: 'openrelayproject',
-    },
-    {
-      urls:       'turn:openrelay.metered.ca:443?transport=tcp',
-      username:   'openrelayproject',
-      credential: 'openrelayproject',
-    },
+      urls: 'free.expressturn.com:3478',
+      username: '000000002088091354',
+      credential: 'gUixIGLNMG5XEn07oaVVF0vHNKk=',
+    }
   ],
   iceCandidatePoolSize: 10,
-  bundlePolicy:         'max-bundle',
-  rtcpMuxPolicy:        'require',
-  // ✅ Prefer relay when direct connection fails
-  iceTransportPolicy:   'all', // keep 'all' so direct is tried first (faster)
+  bundlePolicy: 'max-bundle',
+  rtcpMuxPolicy: 'require',
+  iceTransportPolicy: 'all',
 }
 
 function patchSDP(sdp) {
   const lines = sdp.split('\r\n')
-  let opusPT  = null
+  let opusPT = null
   let inAudio = false
 
   for (const line of lines) {
@@ -98,32 +60,32 @@ function patchSDP(sdp) {
 }
 
 export function useWebRTC(mode = 'video') {
-  const socket      = useRef(null)
-  const pc          = useRef(null)
-  const localRef    = useRef(null)
-  const dcRef       = useRef(null)
-  const roomIdRef   = useRef(null)
-  const iceBuf      = useRef([])
-  const rdReady     = useRef(false)
-  const audioElRef  = useRef(null)
+  const socket = useRef(null)
+  const pc = useRef(null)
+  const localRef = useRef(null)
+  const dcRef = useRef(null)
+  const roomIdRef = useRef(null)
+  const iceBuf = useRef([])
+  const rdReady = useRef(false)
+  const audioElRef = useRef(null)
 
-  const [localStream,  setLocal]     = useState(null)
-  const [remoteStream, setRemote]    = useState(null)
-  const [status,       setStatus]    = useState('idle')
-  const [messages,     setMessages]  = useState([])
-  const [chatReady,    setChatReady] = useState(false)
-  const [isMuted,      setMuted]     = useState(false)
-  const [isCamOff,     setCamOff]    = useState(false)
-  const [roomId,       setRoomId]    = useState(null)
+  const [localStream, setLocal] = useState(null)
+  const [remoteStream, setRemote] = useState(null)
+  const [status, setStatus] = useState('idle')
+  const [messages, setMessages] = useState([])
+  const [chatReady, setChatReady] = useState(false)
+  const [isMuted, setMuted] = useState(false)
+  const [isCamOff, setCamOff] = useState(false)
+  const [roomId, setRoomId] = useState(null)
 
   // ✅ ONE persistent audio element — audio mode only
   useEffect(() => {
     document.getElementById('__rtc_audio')?.remove()
-    const el         = document.createElement('audio')
-    el.id            = '__rtc_audio'
-    el.autoplay      = false
-    el.muted         = false
-    el.volume        = 0.9
+    const el = document.createElement('audio')
+    el.id = '__rtc_audio'
+    el.autoplay = false
+    el.muted = false
+    el.volume = 0.9
     el.style.cssText = 'position:fixed;left:-9999px;width:1px;height:1px;opacity:0.001'
     document.body.appendChild(el)
     audioElRef.current = el
@@ -138,8 +100,8 @@ export function useWebRTC(mode = 'video') {
     const el = audioElRef.current
     if (!el || mode !== 'audio') return
     el.srcObject = stream
-    el.muted     = false
-    el.volume    = 0.9
+    el.muted = false
+    el.volume = 0.9
     el.play().catch(e => console.warn('Audio play:', e))
   }, [mode])
 
@@ -152,27 +114,27 @@ export function useWebRTC(mode = 'video') {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: mode === 'video' ? {
-          width:      { ideal: 1280 },
-          height:     { ideal: 720 },
-          frameRate:  { ideal: 30 },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 30 },
           facingMode: 'user',
         } : false,
         audio: {
-          echoCancellation:      true,
-          noiseSuppression:      true,
-          autoGainControl:       true,
-          channelCount:          1,
-          sampleRate:            48000,
-          sampleSize:            16,
-          latency:               0,
-          googEchoCancellation:  true,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+          sampleRate: 48000,
+          sampleSize: 16,
+          latency: 0,
+          googEchoCancellation: true,
           googEchoCancellation2: true,
-          googAutoGainControl:   true,
-          googAutoGainControl2:  true,
-          googNoiseSuppression:  true,
-          googHighpassFilter:    true,
-          googNoiseReduction:    true,
-          googLeakyBucket:       true,
+          googAutoGainControl: true,
+          googAutoGainControl2: true,
+          googNoiseSuppression: true,
+          googHighpassFilter: true,
+          googNoiseReduction: true,
+          googLeakyBucket: true,
         },
       })
       localRef.current = stream
@@ -185,9 +147,9 @@ export function useWebRTC(mode = 'video') {
           audio: {
             echoCancellation: true,
             noiseSuppression: true,
-            autoGainControl:  true,
-            channelCount:     1,
-            sampleRate:       48000,
+            autoGainControl: true,
+            channelCount: 1,
+            sampleRate: 48000,
           },
           video: mode === 'video',
         })
@@ -203,9 +165,9 @@ export function useWebRTC(mode = 'video') {
 
   const setupDC = useCallback((dc) => {
     dcRef.current = dc
-    dc.onopen    = () => { console.log('✅ DC OPEN'); setChatReady(true)  }
-    dc.onclose   = () => { console.log('❌ DC CLOSED'); setChatReady(false) }
-    dc.onerror   = e => console.error('DC ERROR:', e.error?.message || e)
+    dc.onopen = () => { console.log('✅ DC OPEN'); setChatReady(true) }
+    dc.onclose = () => { console.log('❌ DC CLOSED'); setChatReady(false) }
+    dc.onerror = e => console.error('DC ERROR:', e.error?.message || e)
     dc.onmessage = ({ data }) => {
       try { addMsg({ ...JSON.parse(data), fromMe: false }) }
       catch { addMsg({ text: data, fromMe: false, ts: Date.now() }) }
@@ -224,10 +186,10 @@ export function useWebRTC(mode = 'video') {
   const buildPC = useCallback(async (isOfferer) => {
     dcRef.current?.close()
     pc.current?.close()
-    pc.current      = null
-    dcRef.current   = null
+    pc.current = null
+    dcRef.current = null
     rdReady.current = false
-    iceBuf.current  = []
+    iceBuf.current = []
     setChatReady(false)
 
     const stream = localRef.current || await getMedia()
@@ -296,16 +258,16 @@ export function useWebRTC(mode = 'video') {
     const s = io(SOCKET_URL, {
       transports: ['websocket', 'polling'],
       // ✅ Keep socket alive across India network fluctuations
-      reconnection:        true,
+      reconnection: true,
       reconnectionAttempts: 10,
-      reconnectionDelay:   1000,
-      timeout:             20000,
+      reconnectionDelay: 1000,
+      timeout: 20000,
     })
     socket.current = s
 
-    s.on('connect',       () => console.log('✅ Socket:', s.id))
-    s.on('disconnect',    r  => console.warn('⚠️ Socket disconnected:', r))
-    s.on('connect_error', e  => console.error('❌ Socket error:', e.message))
+    s.on('connect', () => console.log('✅ Socket:', s.id))
+    s.on('disconnect', r => console.warn('⚠️ Socket disconnected:', r))
+    s.on('connect_error', e => console.error('❌ Socket error:', e.message))
 
     s.on('matched', async ({ roomId: rid, role }) => {
       roomIdRef.current = rid
@@ -316,8 +278,8 @@ export function useWebRTC(mode = 'video') {
       if (!conn) return
       if (role === 'offerer') {
         const offer = await conn.createOffer({
-          offerToReceiveAudio:    true,
-          offerToReceiveVideo:    mode === 'video',
+          offerToReceiveAudio: true,
+          offerToReceiveVideo: mode === 'video',
           voiceActivityDetection: true,
         })
         const sdp = patchSDP(offer.sdp)
@@ -334,7 +296,7 @@ export function useWebRTC(mode = 'video') {
       rdReady.current = true
       await flushIce()
       const answer = await pc.current.createAnswer({ voiceActivityDetection: true })
-      const sdp    = patchSDP(answer.sdp)
+      const sdp = patchSDP(answer.sdp)
       await pc.current.setLocalDescription({ type: answer.type, sdp })
       s.emit('answer', { roomId: roomIdRef.current, answer: { type: answer.type, sdp } })
     })
@@ -355,16 +317,16 @@ export function useWebRTC(mode = 'video') {
       catch (e) { console.warn('[ICE add err]', e) }
     })
 
-    s.on('chat',      ({ text, ts }) => addMsg({ text, ts, fromMe: false }))
-    s.on('waiting',   () => setStatus('waiting'))
+    s.on('chat', ({ text, ts }) => addMsg({ text, ts, fromMe: false }))
+    s.on('waiting', () => setStatus('waiting'))
     s.on('cancelled', () => setStatus('idle'))
     s.on('peer:left', () => {
       pc.current?.close()
-      pc.current        = null
-      dcRef.current     = null
+      pc.current = null
+      dcRef.current = null
       roomIdRef.current = null
-      rdReady.current   = false
-      iceBuf.current    = []
+      rdReady.current = false
+      iceBuf.current = []
       setRoomId(null); setStatus('idle'); setRemote(null); setChatReady(false)
       if (audioElRef.current) audioElRef.current.srcObject = null
     })
@@ -381,7 +343,7 @@ export function useWebRTC(mode = 'video') {
   const sendMessage = useCallback((text) => {
     if (!text.trim()) return
     const msg = { text: text.trim(), ts: Date.now(), fromMe: true }
-    const dc  = dcRef.current
+    const dc = dcRef.current
     if (dc?.readyState === 'open') {
       dc.send(JSON.stringify({ text: msg.text, ts: msg.ts }))
     } else if (roomIdRef.current) {
@@ -401,9 +363,9 @@ export function useWebRTC(mode = 'video') {
 
   const skipStranger = useCallback(() => {
     pc.current?.close()
-    pc.current        = null; dcRef.current     = null
-    roomIdRef.current = null; rdReady.current   = false
-    iceBuf.current    = []
+    pc.current = null; dcRef.current = null
+    roomIdRef.current = null; rdReady.current = false
+    iceBuf.current = []
     setRemote(null); setMessages([]); setChatReady(false)
     if (audioElRef.current) audioElRef.current.srcObject = null
     socket.current?.emit('skip', { mode }); setStatus('waiting')
