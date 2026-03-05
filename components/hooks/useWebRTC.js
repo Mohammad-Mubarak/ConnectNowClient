@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { io } from 'socket.io-client';
 
-const URL = 'https://localhost:3001';
+// const URL = 'https://localhost:3001';
+const URL = 'https://connectnow-ctcz.onrender.com'
 
 const ICE = {
   iceServers: [
