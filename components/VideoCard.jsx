@@ -233,84 +233,110 @@
 
 
 
-
-
-
-
 'use client'
 import { useEffect, useRef, useState } from 'react'
 import {
   Camera, CameraOff, Mic, MicOff,
-  Maximize2, Users, Radio, Waves
+  Maximize2, Users, Radio, Waves, Signal
 } from 'lucide-react'
 
-// ── LiveWaveform ──────────────────────────────────────────────────────────────
-function LiveWaveform({ stream, color = '#2dd4bf', barCount = 14 }) {
-  const [bars, setBars] = useState(new Array(barCount).fill(3))
+// ── Waveform ──────────────────────────────────────────────────────────────────
+function LiveWaveform({ stream, color = '#2dd4bf', barCount = 28 }) {
+  const [bars, setBars] = useState(new Array(barCount).fill(2))
   const animRef         = useRef(null)
 
   useEffect(() => {
-    if (!stream) {
-      setBars(new Array(barCount).fill(3))
-      return
-    }
+    if (!stream) { setBars(new Array(barCount).fill(2)); return }
+    const ctx      = new (window.AudioContext || window.webkitAudioContext)()
+    const source   = ctx.createMediaStreamSource(stream)
+    const analyser = ctx.createAnalyser()
+    analyser.fftSize               = 512
+    analyser.smoothingTimeConstant = 0.85
+    source.connect(analyser) // ✅ NEVER to destination
 
-    const audioCtx = new (window.AudioContext || window.webkitAudioContext)()
-    const source   = audioCtx.createMediaStreamSource(stream)
-    const analyser = audioCtx.createAnalyser()
-    analyser.fftSize               = 128
-    analyser.smoothingTimeConstant = 0.75
-
-    // ✅ ONLY connect to analyser — NEVER to destination (causes echo)
-    source.connect(analyser)
-
-    const data      = new Uint8Array(analyser.frequencyBinCount)
-    const THRESHOLD = 8
-
+    const data = new Uint8Array(analyser.frequencyBinCount)
     const tick = () => {
       analyser.getByteFrequencyData(data)
       const avg = data.reduce((s, v) => s + v, 0) / data.length
-      if (avg < THRESHOLD) {
-        setBars(new Array(barCount).fill(3))
+
+      if (avg < 5) {
+        const t    = Date.now() / 800
+        const idle = Array.from({ length: barCount }, (_, i) => {
+          const c    = (barCount - 1) / 2
+          const dist = Math.abs(i - c) / c
+          return Math.max(2, Math.round(3 + Math.sin(t + i * 0.4) * 2 * (1 - dist)))
+        })
+        setBars(idle)
       } else {
         const step = Math.floor(data.length / barCount)
-        setBars(
-          Array.from({ length: barCount }, (_, i) => {
-            const center = barCount / 2
-            const dist   = Math.abs(i - center) / center
-            const val    = data[i * step] || 0
-            const h      = Math.max(3, Math.round((val / 255) * 40))
-            return Math.max(3, Math.round(h * (1 - dist * 0.25)))
-          })
-        )
+        setBars(Array.from({ length: barCount }, (_, i) => {
+          const c    = (barCount - 1) / 2
+          const dist = Math.abs(i - c) / c
+          const val  = data[i * step] || 0
+          const h    = Math.max(2, Math.round((val / 255) * 56))
+          return Math.max(2, Math.round(h * (1 - dist * 0.22)))
+        }))
       }
       animRef.current = requestAnimationFrame(tick)
     }
-
     animRef.current = requestAnimationFrame(tick)
-
     return () => {
       cancelAnimationFrame(animRef.current)
       try { source.disconnect() } catch (_) {}
-      audioCtx.close()
+      ctx.close()
     }
   }, [stream, barCount])
 
   return (
-    <div className="flex items-end justify-center gap-[3px] h-10 w-full px-4">
-      {bars.map((h, i) => (
-        <div
-          key={i}
-          className="rounded-full transition-all duration-75"
+    <div className="flex items-center justify-center gap-[2.5px]"
+      style={{ height: '60px', width: '100%' }}
+    >
+      {bars.map((h, i) => {
+        const c       = (barCount - 1) / 2
+        const dist    = Math.abs(i - c) / c
+        const opacity = 0.25 + (1 - dist) * 0.75
+        return (
+          <div key={i}
+            style={{
+              height:       `${h}px`,
+              width:        '3px',
+              borderRadius: '999px',
+              background:   color,
+              opacity,
+              transition:   'height 55ms ease, opacity 55ms ease',
+              boxShadow:    h > 20 ? `0 0 6px ${color}cc` : 'none',
+            }}
+          />
+        )
+      })}
+    </div>
+  )
+}
+
+// ── Ripple Rings ──────────────────────────────────────────────────────────────
+function RippleRings({ color, active, count = 4, base = 92 }) {
+  return (
+    <>
+      {Array.from({ length: count }, (_, i) => (
+        <div key={i}
+          className="absolute rounded-full pointer-events-none"
           style={{
-            height:          `${h}px`,
-            width:           '5px',
-            backgroundColor: color,
-            opacity:         0.5 + (h / 40) * 0.5,
+            width:                   `${base + i * 36}px`,
+            height:                  `${base + i * 36}px`,
+            top:                     '50%',
+            left:                    '50%',
+            transform:               'translate(-50%,-50%)',
+            border:                  `1px solid ${color}`,
+            opacity:                 active ? (0.22 - i * 0.04) : (0.06 - i * 0.01),
+            animationName:           'pulse-ring',
+            animationDuration:       `${active ? 2 + i * 0.5 : 3 + i * 0.8}s`,
+            animationTimingFunction: 'ease-in-out',
+            animationIterationCount: 'infinite',
+            animationDelay:          `${i * 0.35}s`,
           }}
         />
       ))}
-    </div>
+    </>
   )
 }
 
@@ -326,295 +352,435 @@ export default function VideoCard({
 }) {
   const videoRef = useRef(null)
   const isAudio  = mode === 'audio'
+  const teal     = '#2dd4bf'
+  const violet   = '#a78bfa'
+  const color    = isYou ? teal : violet
 
-  // ── VIDEO MODE: attach stream to <video> element
-  // For stranger: muted=false so their audio plays through <video>
-  // For you:      muted=true  so you don't hear yourself
-  // ✅ NO separate <audio> element needed — <video> handles audio in video mode
+  // ✅ PDF fix: local muted+vol=0, stranger vol=0.9
   useEffect(() => {
     if (!videoRef.current || !stream) return
     videoRef.current.srcObject = stream
-  }, [stream])
-
-  // ── AUDIO MODE: audio is handled by useWebRTC's persistent
-  // document.body <audio> element. We do NOT create any <audio>
-  // element here — that was causing double playback = echo
-  // ✅ Nothing needed here for audio mode
+    videoRef.current.muted     = isYou
+    videoRef.current.volume    = isYou ? 0 : 0.9
+  }, [stream, isYou])
 
   return (
-    <div className={`
-      relative rounded-2xl overflow-hidden flex-1 glass border
-      transition-all duration-500 min-h-[360px]
-      ${isAudio
-        ? isYou ? 'border-teal-500/30' : 'border-violet-500/30'
-        : isYou ? 'border-teal-500/30 glow-teal' : 'border-violet-500/30 glow-purple'
-      }
-    `}>
+    <div
+      className="relative rounded-3xl overflow-hidden flex-1 min-h-[420px]"
+      style={{
+        background: isYou
+          ? 'linear-gradient(160deg,#040d0d 0%,#061414 50%,#081c1c 100%)'
+          : 'linear-gradient(160deg,#060408 0%,#0c0618 50%,#120825 100%)',
+        border:    `1px solid ${color}18`,
+        boxShadow: `0 0 0 1px ${color}0a,0 20px 60px rgba(0,0,0,0.6),inset 0 1px 0 ${color}15`,
+      }}
+    >
+      {/* Noise texture */}
+      <div className="absolute inset-0 opacity-[0.015] pointer-events-none"
+        style={{
+          backgroundImage: `url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E")`,
+          backgroundSize:  '128px',
+        }}
+      />
 
-      {/* ══════════════ AUDIO MODE ══════════════ */}
+      {/* Top edge glow */}
+      <div className="absolute top-0 left-8 right-8 h-px pointer-events-none"
+        style={{ background: `linear-gradient(90deg,transparent,${color}60,transparent)` }}
+      />
+
+      {/* Ambient glow */}
+      <div className="absolute pointer-events-none"
+        style={{
+          top:        '30%',
+          left:       '50%',
+          transform:  'translate(-50%,-50%)',
+          width:      '280px',
+          height:     '280px',
+          background: `radial-gradient(circle,${color}0e 0%,transparent 70%)`,
+        }}
+      />
+
+      {/* ════════ AUDIO MODE ════════ */}
       {isAudio && (
-        <div className={`
-          absolute inset-0 flex flex-col items-center justify-center gap-6
-          ${isYou
-            ? 'bg-gradient-to-br from-[#071a1a] via-[#0a2020] to-[#0d2535]'
-            : 'bg-gradient-to-br from-[#0d0718] via-[#130a28] to-[#1a0d35]'}
-        `}>
+        <div className="absolute inset-0 flex flex-col items-center justify-between px-5 py-5">
 
-          {/* Radial glow */}
-          <div className={`absolute inset-0 opacity-25 ${
-            isYou
-              ? 'bg-[radial-gradient(ellipse_at_center,_#0d9488_0%,_transparent_65%)]'
-              : 'bg-[radial-gradient(ellipse_at_center,_#7c3aed_0%,_transparent_65%)]'
-          }`} />
-
-          {/* ── Searching state (stranger only) */}
-          {isSearching && !isYou ? (
-            <div className="relative flex flex-col items-center gap-6 z-10">
-              {[1, 2, 3].map(i => (
-                <div key={i}
-                  className="absolute rounded-full border border-violet-400/25"
-                  style={{
-                    width:          `${80 + i * 48}px`,
-                    height:         `${80 + i * 48}px`,
-                    top: '50%', left: '50%',
-                    transform:      'translate(-50%,-50%)',
-                    animation:      'ripple 2.4s ease-out infinite',
-                    animationDelay: `${i * 0.5}s`,
-                  }}
-                />
-              ))}
-              <div className="w-24 h-24 rounded-full flex items-center justify-center border-2 bg-violet-500/10 border-violet-400/50 z-10">
-                <Radio size={32} className="text-violet-400" />
-              </div>
-              <div className="text-center mt-16">
-                <p className="text-sm font-semibold text-violet-300 tracking-wide">
-                  Finding voice partner
-                </p>
-                <div className="flex justify-center gap-1.5 mt-2">
-                  {[0, 1, 2].map(i => (
-                    <span key={i}
-                      className="w-2 h-2 bg-violet-400 rounded-full inline-block"
-                      style={{ animation: 'bounce 1.2s infinite', animationDelay: `${i * 0.2}s` }}
-                    />
-                  ))}
-                </div>
-              </div>
-            </div>
-
-          ) : (
-            /* ── Connected / live state */
-            <div className="relative flex flex-col items-center gap-4 z-10 w-full">
-
-              {/* Pulse rings */}
-              <div className="relative flex items-center justify-center mb-1">
-                {[1, 2, 3].map(i => (
-                  <div key={i}
-                    className={`absolute rounded-full ${
-                      isYou
-                        ? 'border border-teal-400/20 bg-teal-400/[0.03]'
-                        : 'border border-violet-400/20 bg-violet-400/[0.03]'
-                    }`}
-                    style={{
-                      width:          `${100 + i * 44}px`,
-                      height:         `${100 + i * 44}px`,
-                      animation:      `pulse-ring ${1.4 + i * 0.35}s ease-in-out infinite`,
-                      animationDelay: `${i * 0.25}s`,
-                    }}
-                  />
-                ))}
-
-                {/* Avatar */}
-                <div className={`
-                  relative z-10 w-24 h-24 rounded-full flex items-center
-                  justify-center text-4xl border-2
-                  ${isYou
-                    ? 'bg-gradient-to-br from-teal-500/30 to-teal-700/20 border-teal-400/60'
-                    : 'bg-gradient-to-br from-violet-500/30 to-violet-700/20 border-violet-400/60'}
-                `}>
-                  {isYou ? '👤' : stream ? '🎭' : '❓'}
-
-                  {/* Online dot */}
-                  <div className={`
-                    absolute bottom-1 right-1 w-4 h-4 rounded-full border-2
-                    ${isYou ? 'border-[#071a1a]' : 'border-[#0d0718]'}
-                    ${isYou ? 'bg-teal-400' : stream ? 'bg-green-400' : 'bg-gray-500'}
-                  `} />
-                </div>
-              </div>
-
-              {/* Name */}
-              <p className={`text-sm font-semibold tracking-wide ${
-                isYou ? 'text-teal-300' : 'text-violet-300'
-              }`}>
-                {isYou ? 'You' : stream ? 'Stranger' : 'Waiting...'}
-              </p>
-
-              {/* ✅ Waveform — only reacts when speaking */}
-              <LiveWaveform
-                stream={stream}
-                color={isYou ? '#2dd4bf' : '#8b5cf6'}
-                barCount={14}
-              />
-            </div>
-          )}
-
-          {/* Top label badge */}
-          <div className={`
-            absolute top-3 left-3 flex items-center gap-2 px-3 py-1.5
-            rounded-xl text-xs font-semibold glass border
-            ${isYou
-              ? 'border-teal-500/40 text-teal-300'
-              : 'border-violet-500/40 text-violet-300'}
-          `}>
-            {isMuted
-              ? <MicOff size={11} className="text-red-400" />
-              : <Mic    size={11} />}
-            {label} · Audio
-          </div>
-
-          {/* Bottom status */}
-          <div className="absolute bottom-3 left-4 right-4 flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <div className={`w-2.5 h-2.5 rounded-full ${
-                isYou
-                  ? 'bg-teal-400 animate-pulse'
-                  : isSearching
-                    ? 'bg-yellow-400 animate-ping'
-                    : stream
-                      ? 'bg-green-400 animate-pulse'
-                      : 'bg-gray-500'
-              }`} />
-              <span className="text-xs text-gray-400 font-medium">
-                {isYou
-                  ? isMuted ? 'Muted' : 'Mic Live'
-                  : isSearching
-                    ? 'Searching...'
-                    : stream ? 'Connected' : 'Waiting...'}
+          {/* Top bar */}
+          <div className="w-full flex items-center justify-between">
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full"
+              style={{
+                background:     `${color}0f`,
+                border:         `1px solid ${color}28`,
+                backdropFilter: 'blur(8px)',
+              }}
+            >
+              {isMuted
+                ? <MicOff size={11} className="text-red-400" />
+                : <Mic    size={11} style={{ color }} />}
+              <span className="text-xs font-semibold tracking-wide" style={{ color }}>
+                {label}
               </span>
             </div>
-            {isYou && (
-              <div className="p-1.5 glass rounded-lg border border-white/10">
-                <Waves size={12} className="text-teal-400" />
+
+            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full"
+              style={{ background: `${color}0a`, border: `1px solid ${color}20` }}
+            >
+              <div className="w-1.5 h-1.5 rounded-full"
+                style={{
+                  background:              isYou ? teal : isSearching ? '#fbbf24' : stream ? '#34d399' : '#4b5563',
+                  animationName:           'pulse',
+                  animationDuration:       '2s',
+                  animationTimingFunction: 'ease-in-out',
+                  animationIterationCount: 'infinite',
+                }}
+              />
+              <span className="text-[10px] font-mono font-medium"
+                style={{ color: `${color}80` }}
+              >
+                {isYou ? (isMuted ? 'MUTED' : 'LIVE') : isSearching ? 'SCAN...' : stream ? 'ACTIVE' : 'IDLE'}
+              </span>
+            </div>
+          </div>
+
+          {/* Center */}
+          <div className="flex-1 flex flex-col items-center justify-center gap-6 w-full">
+            {isSearching && !isYou ? (
+
+              /* Searching */
+              <div className="flex flex-col items-center gap-8">
+                <div className="relative flex items-center justify-center"
+                  style={{ width: '180px', height: '180px' }}
+                >
+                  {[1,2,3,4,5].map(i => (
+                    <div key={i}
+                      className="absolute rounded-full"
+                      style={{
+                        width:                   `${36 + i * 28}px`,
+                        height:                  `${36 + i * 28}px`,
+                        top:                     '50%',
+                        left:                    '50%',
+                        transform:               'translate(-50%,-50%)',
+                        border:                  `1px solid ${violet}`,
+                        opacity:                 0.06 + (5 - i) * 0.06,
+                        animationName:           'ripple',
+                        animationDuration:       '3.5s',
+                        animationTimingFunction: 'ease-out',
+                        animationIterationCount: 'infinite',
+                        animationDelay:          `${i * 0.55}s`,
+                      }}
+                    />
+                  ))}
+                  <div className="relative z-10 w-16 h-16 rounded-full flex items-center justify-center"
+                    style={{
+                      background: `radial-gradient(135deg,${violet}20,${violet}05)`,
+                      border:     `1.5px solid ${violet}45`,
+                      boxShadow:  `0 0 30px ${violet}20,inset 0 0 20px ${violet}08`,
+                    }}
+                  >
+                    <Radio size={22} style={{ color: violet }} />
+                  </div>
+                </div>
+
+                <div className="flex flex-col items-center gap-3">
+                  <p className="text-xs font-bold tracking-[0.35em] uppercase"
+                    style={{ color: `${violet}cc` }}
+                  >
+                    Finding Partner
+                  </p>
+                  <div className="relative w-32 h-0.5 rounded-full overflow-hidden"
+                    style={{ background: `${violet}15` }}
+                  >
+                    <div className="absolute top-0 left-0 h-full w-12 rounded-full"
+                      style={{
+                        background:              `linear-gradient(90deg,transparent,${violet},transparent)`,
+                        animationName:           'scan-line',
+                        animationDuration:       '1.8s',
+                        animationTimingFunction: 'ease-in-out',
+                        animationIterationCount: 'infinite',
+                      }}
+                    />
+                  </div>
+                </div>
+              </div>
+
+            ) : (
+
+              /* Connected / Idle */
+              <div className="flex flex-col items-center w-full">
+
+                {/* Avatar with rings */}
+                <div className="relative flex items-center justify-center mb-6"
+                  style={{ width: '190px', height: '190px' }}
+                >
+                  <RippleRings color={color} active={!!stream && !isMuted} count={4} base={88} />
+                  <div className="relative z-10 w-24 h-24 rounded-full flex items-center justify-center"
+                    style={{
+                      background: isYou
+                        ? 'radial-gradient(135deg,#0f3535 0%,#061818 100%)'
+                        : 'radial-gradient(135deg,#1e0a40 0%,#0a0520 100%)',
+                      border:    `2px solid ${color}40`,
+                      boxShadow: `0 0 0 1px ${color}15,0 0 40px ${color}20,inset 0 1px 0 ${color}20`,
+                    }}
+                  >
+                    <span style={{ fontSize: 38, filter: 'drop-shadow(0 2px 8px rgba(0,0,0,0.5))' }}>
+                      {isYou ? '🎙️' : stream ? '🎭' : '❓'}
+                    </span>
+                    <div className="absolute -bottom-1 -right-1 w-5 h-5 rounded-full"
+                      style={{
+                        background: isYou ? teal : stream ? '#34d399' : '#374151',
+                        border:     `2.5px solid ${isYou ? '#061818' : '#0a0520'}`,
+                        boxShadow:  `0 0 10px ${isYou ? teal : stream ? '#34d399' : 'transparent'}80`,
+                      }}
+                    />
+                  </div>
+                </div>
+
+                <p className="text-sm font-bold tracking-wide mb-1" style={{ color }}>
+                  {isYou ? 'You' : stream ? 'Stranger' : 'Waiting...'}
+                </p>
+                <p className="text-[11px] font-mono mb-7" style={{ color: `${color}50` }}>
+                  {isYou
+                    ? isMuted ? '[ mic disabled ]' : '[ 48kHz · mono · live ]'
+                    : stream  ? '[ peer connected ]'
+                    :           '[ awaiting peer ]'}
+                </p>
+
+                {/* ✅ Free floating waveform — no box */}
+                <LiveWaveform stream={stream} color={color} barCount={28} />
+              </div>
+            )}
+          </div>
+
+          {/* Bottom bar */}
+          <div className="w-full flex items-center justify-between">
+            <div className="flex items-center gap-1.5">
+              <Signal size={11} style={{ color: `${color}50` }} />
+              <span className="text-[10px] font-mono" style={{ color: `${color}45` }}>
+                {isYou ? 'opus · 48k · ec:on' : stream ? 'p2p · webrtc' : 'standby'}
+              </span>
+            </div>
+            {isYou && !isMuted && (
+              <div className="flex items-center gap-1.5">
+                <Waves size={10} style={{ color: `${color}60` }} />
+                <span className="text-[10px] font-mono" style={{ color: `${color}45` }}>
+                  aec active
+                </span>
               </div>
             )}
           </div>
         </div>
       )}
 
-      {/* ══════════════ VIDEO MODE ══════════════ */}
+      {/* ════════ VIDEO MODE ════════ */}
       {!isAudio && (
-        <div className="absolute inset-0 bg-gradient-to-br from-slate-900 to-slate-950 flex items-center justify-center">
+        <div className="absolute inset-0">
 
-          {/* ✅ Video element handles BOTH video and audio for stranger
-              muted={isYou} ensures:
-              - Your preview: silent (no echo)
-              - Stranger:     audio plays through this <video> tag
-              NO separate <audio> needed in video mode */}
           {stream && !isCamOff && (
             <video
               ref={videoRef}
               autoPlay
               playsInline
-              muted={isYou}
               className="absolute inset-0 w-full h-full object-cover"
             />
           )}
 
-          {/* Overlays when no stream */}
-          {(!stream || isCamOff) && (
-            isYou ? (
-              <div className="flex flex-col items-center gap-3 z-10">
-                <div className="w-24 h-24 rounded-full bg-gradient-to-br from-teal-500/30 to-teal-600/20 border border-teal-500/40 flex items-center justify-center">
-                  {isCamOff
-                    ? <CameraOff size={36} className="text-red-400" />
-                    : <Camera    size={36} className="text-teal-400" />}
-                </div>
-                <p className="text-gray-400 text-sm">
-                  {isCamOff ? 'Camera off' : 'Starting camera...'}
-                </p>
-              </div>
-            ) : isSearching ? (
-              <div className="flex flex-col items-center gap-4 z-10">
-                <div className="relative">
-                  <div className="w-24 h-24 rounded-full bg-gradient-to-br from-violet-500/20 to-violet-600/10 border border-violet-500/30 flex items-center justify-center">
-                    <div className="w-14 h-14 rounded-full bg-violet-500/20 flex items-center justify-center">
-                      <Users size={28} className="text-violet-400" />
-                    </div>
-                  </div>
-                  <div
-                    className="absolute inset-0 rounded-full border border-violet-400/25 animate-spin"
-                    style={{ animationDuration: '3s' }}
-                  >
-                    <div className="absolute -top-1 left-1/2 w-2.5 h-2.5 bg-violet-400 rounded-full -translate-x-1/2" />
-                  </div>
-                </div>
-                <div className="text-center">
-                  <p className="text-violet-300 text-sm font-medium">Finding a stranger</p>
-                  <div className="flex justify-center gap-1.5 mt-1.5">
-                    {[0, 1, 2].map(i => (
-                      <span key={i}
-                        className="w-1.5 h-1.5 bg-violet-400 rounded-full inline-block"
-                        style={{ animation: 'bounce 1s infinite', animationDelay: `${i * 0.2}s` }}
-                      />
-                    ))}
-                  </div>
-                </div>
-              </div>
-            ) : (
-              <div className="flex flex-col items-center gap-3 z-10">
-                <div className="w-24 h-24 rounded-full bg-gray-700/50 border border-gray-600/30 flex items-center justify-center">
-                  <CameraOff size={36} className="text-gray-500" />
-                </div>
-                <p className="text-gray-500 text-sm">Waiting to connect...</p>
-              </div>
-            )
+          {stream && !isCamOff && (
+            <div className="absolute inset-0 pointer-events-none"
+              style={{
+                background: `linear-gradient(180deg,
+                  rgba(0,0,0,0.45) 0%,
+                  transparent 30%,
+                  transparent 65%,
+                  rgba(0,0,0,0.7) 100%)`,
+              }}
+            />
           )}
 
-          {/* Label badge */}
-          <div className={`
-            absolute top-3 left-3 px-3 py-1.5 rounded-xl
-            text-xs font-semibold glass border z-20
-            ${isYou
-              ? 'border-teal-500/30 text-teal-300'
-              : 'border-violet-500/30 text-violet-300'}
-          `}>
-            {label}
-          </div>
+          {/* No stream overlays */}
+          {(!stream || isCamOff) && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-5">
+              {isYou ? (
+                <>
+                  <div className="relative flex items-center justify-center"
+                    style={{ width: 140, height: 140 }}
+                  >
+                    <RippleRings color={teal} active={!isCamOff} count={3} base={76} />
+                    <div className="relative z-10 w-20 h-20 rounded-full flex items-center justify-center"
+                      style={{
+                        background: 'radial-gradient(135deg,#0f3535,#061818)',
+                        border:     `2px solid ${teal}35`,
+                        boxShadow:  `0 0 30px ${teal}18`,
+                      }}
+                    >
+                      {isCamOff
+                        ? <CameraOff size={30} className="text-red-400" />
+                        : <Camera    size={30} style={{ color: teal }} />}
+                    </div>
+                  </div>
+                  <p className="text-sm font-medium" style={{ color: `${teal}80` }}>
+                    {isCamOff ? 'Camera disabled' : 'Starting camera...'}
+                  </p>
+                </>
 
-          {/* Fullscreen button */}
-          <button
-            onClick={() => videoRef.current?.requestFullscreen?.()}
-            className="absolute top-3 right-3 p-1.5 glass rounded-xl border border-white/10 hover:bg-white/10 transition-all z-20"
-          >
-            <Maximize2 size={14} className="text-gray-400" />
-          </button>
+              ) : isSearching ? (
+                <>
+                  <div className="relative flex items-center justify-center"
+                    style={{ width: 160, height: 160 }}
+                  >
+                    {[1,2,3,4].map(i => (
+                      <div key={i}
+                        className="absolute rounded-full"
+                        style={{
+                          width:                   `${44 + i * 28}px`,
+                          height:                  `${44 + i * 28}px`,
+                          top:                     '50%',
+                          left:                    '50%',
+                          transform:               'translate(-50%,-50%)',
+                          border:                  `1px solid ${violet}`,
+                          opacity:                 0.05 + (4 - i) * 0.07,
+                          animationName:           'ripple',
+                          animationDuration:       '3s',
+                          animationTimingFunction: 'ease-out',
+                          animationIterationCount: 'infinite',
+                          animationDelay:          `${i * 0.5}s`,
+                        }}
+                      />
+                    ))}
+                    <div className="relative z-10 w-[72px] h-[72px] rounded-full flex items-center justify-center"
+                      style={{
+                        background: `radial-gradient(135deg,${violet}18,${violet}05)`,
+                        border:     `2px solid ${violet}40`,
+                        boxShadow:  `0 0 28px ${violet}20`,
+                      }}
+                    >
+                      <Users size={26} style={{ color: violet }} />
+                    </div>
+                  </div>
+                  <div className="flex flex-col items-center gap-2">
+                    <p className="text-xs font-bold tracking-[0.3em] uppercase"
+                      style={{ color: `${violet}cc` }}
+                    >
+                      Finding Stranger
+                    </p>
+                    <div className="relative w-28 h-0.5 rounded-full overflow-hidden"
+                      style={{ background: `${violet}18` }}
+                    >
+                      <div className="absolute top-0 left-0 h-full w-10 rounded-full"
+                        style={{
+                          background:              `linear-gradient(90deg,transparent,${violet},transparent)`,
+                          animationName:           'scan-line',
+                          animationDuration:       '1.8s',
+                          animationTimingFunction: 'ease-in-out',
+                          animationIterationCount: 'infinite',
+                        }}
+                      />
+                    </div>
+                  </div>
+                </>
 
-          {/* Bottom status bar */}
-          <div className="absolute bottom-3 left-3 right-3 flex items-center justify-between z-20">
-            <div className="flex items-center gap-2">
-              <div className={`w-2 h-2 rounded-full ${
-                isYou ? 'bg-teal-400' : stream ? 'bg-green-400' : 'bg-violet-400'
-              } animate-pulse`} />
-              <span className="text-xs text-gray-400">
-                {isYou
-                  ? isCamOff ? 'Cam off' : 'Live'
-                  : isSearching
-                    ? 'Searching...'
-                    : stream ? 'Connected' : 'Waiting...'}
+              ) : (
+                <>
+                  <div className="w-20 h-20 rounded-full flex items-center justify-center"
+                    style={{
+                      background: 'rgba(255,255,255,0.02)',
+                      border:     '1px solid rgba(255,255,255,0.06)',
+                    }}
+                  >
+                    <CameraOff size={28} className="text-gray-700" />
+                  </div>
+                  <p className="text-xs text-gray-700 font-medium tracking-wide">
+                    Waiting to connect
+                  </p>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* Top bar */}
+          <div className="absolute top-0 left-0 right-0 flex items-center justify-between px-4 pt-4 z-20">
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full"
+              style={{
+                background:     'rgba(0,0,0,0.55)',
+                border:         `1px solid ${color}30`,
+                backdropFilter: 'blur(12px)',
+              }}
+            >
+              <div className="w-1.5 h-1.5 rounded-full"
+                style={{
+                  background:              isYou ? teal : stream ? '#34d399' : violet,
+                  animationName:           'pulse',
+                  animationDuration:       '2s',
+                  animationTimingFunction: 'ease-in-out',
+                  animationIterationCount: 'infinite',
+                }}
+              />
+              <span className="text-xs font-semibold" style={{ color }}>
+                {label}
               </span>
             </div>
+
+            <button
+              onClick={() => videoRef.current?.requestFullscreen?.()}
+              className="p-2 rounded-xl transition-all duration-200 hover:scale-110 active:scale-95"
+              style={{
+                background:     'rgba(0,0,0,0.5)',
+                border:         '1px solid rgba(255,255,255,0.1)',
+                backdropFilter: 'blur(12px)',
+              }}
+            >
+              <Maximize2 size={13} className="text-gray-300" />
+            </button>
+          </div>
+
+          {/* Bottom bar */}
+          <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between px-4 pb-4 z-20">
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full"
+              style={{
+                background:     'rgba(0,0,0,0.55)',
+                border:         '1px solid rgba(255,255,255,0.08)',
+                backdropFilter: 'blur(12px)',
+              }}
+            >
+              <div className="w-1.5 h-1.5 rounded-full"
+                style={{
+                  background:              isYou ? teal : stream ? '#34d399' : '#4b5563',
+                  animationName:           'pulse',
+                  animationDuration:       '2s',
+                  animationTimingFunction: 'ease-in-out',
+                  animationIterationCount: 'infinite',
+                }}
+              />
+              <span className="text-[11px] text-gray-300 font-medium">
+                {isYou
+                  ? isCamOff ? 'Camera off' : 'Live'
+                  : isSearching ? 'Searching...'
+                  : stream ? 'Connected' : 'Waiting...'}
+              </span>
+            </div>
+
             {isYou && (
               <div className="flex items-center gap-1.5">
-                <div className="p-1 glass rounded-lg border border-white/10">
-                  {isMuted
-                    ? <MicOff size={12} className="text-red-400" />
-                    : <Mic    size={12} className="text-green-400" />}
-                </div>
-                <div className="p-1 glass rounded-lg border border-white/10">
-                  {isCamOff
-                    ? <CameraOff size={12} className="text-red-400" />
-                    : <Camera    size={12} className="text-teal-400" />}
-                </div>
+                {[
+                  {
+                    icon: isMuted
+                      ? <MicOff  size={12} className="text-red-400" />
+                      : <Mic     size={12} className="text-emerald-400" />,
+                  },
+                  {
+                    icon: isCamOff
+                      ? <CameraOff size={12} className="text-red-400" />
+                      : <Camera    size={12} style={{ color: teal }} />,
+                  },
+                ].map((item, i) => (
+                  <div key={i} className="p-1.5 rounded-full"
+                    style={{
+                      background:     'rgba(0,0,0,0.55)',
+                      border:         '1px solid rgba(255,255,255,0.08)',
+                      backdropFilter: 'blur(12px)',
+                    }}
+                  >
+                    {item.icon}
+                  </div>
+                ))}
               </div>
             )}
           </div>

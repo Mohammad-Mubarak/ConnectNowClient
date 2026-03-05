@@ -76,10 +76,6 @@ body {
   80%, 100% { opacity: 0; }
 }
 
-@keyframes ripple {
-  0% { transform: scale(0.8); opacity: 0.8; }
-  100% { transform: scale(1.6); opacity: 0; }
-}
 
 @keyframes wave-bar {
   0%, 100% { transform: scaleY(1); opacity: 0.6; }
@@ -90,6 +86,40 @@ body {
   0%, 100% { transform: translateY(0px);   }
   50%       { transform: translateY(-10px); }
 }
+
+
+
+
+@keyframes orbit-dot {
+  0%   { transform: rotate(0deg)   translateX(70px) translateY(-50%); }
+  100% { transform: rotate(360deg) translateX(70px) translateY(-50%); }
+}
+
+@keyframes ripple {
+  0%   { transform: translate(-50%,-50%) scale(0.5); opacity: 0.6; }
+  100% { transform: translate(-50%,-50%) scale(2.4); opacity: 0;   }
+}
+
+@keyframes ripple {
+  0%   { transform: translate(-50%,-50%) scale(0.5); opacity: 0.6; }
+  100% { transform: translate(-50%,-50%) scale(2.4); opacity: 0;   }
+}
+
+@keyframes pulse-ring {
+  0%, 100% { transform: translate(-50%,-50%) scale(1);    opacity: 0.18; }
+  50%       { transform: translate(-50%,-50%) scale(1.07); opacity: 0.06; }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1;   }
+  50%       { opacity: 0.4; }
+}
+
+@keyframes scan-line {
+  0%   { left: -30%; }
+  100% { left: 120%; }
+}
+
 
 
 .dot-1 { animation: searching-dots 1.5s infinite 0s; }
