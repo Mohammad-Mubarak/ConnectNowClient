@@ -4,28 +4,25 @@ import { io } from 'socket.io-client';
 // const SOCKET_URL = 'https://localhost:3001';
 const SOCKET_URL = 'https://connectnow-ctcz.onrender.com'
 
-
 const ICE_CONFIG = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
-    { urls: 'stun:stun3.l.google.com:19302' },
   ],
   iceCandidatePoolSize: 10,
-  bundlePolicy: 'max-bundle',
+  bundlePolicy:  'max-bundle',
   rtcpMuxPolicy: 'require',
 };
 
-// ✅ Force Opus + best quality SDP params
+// ✅ Patch SDP — force Opus MONO (required for Chrome AEC to work)
 function patchSDP(sdp) {
-  const lines   = sdp.split('\r\n');
-  let opusPT    = null;
-  let inAudio   = false;
+  const lines  = sdp.split('\r\n');
+  let   opusPT = null;
+  let   inAudio = false;
 
-  // Find Opus payload type
   for (const line of lines) {
-    if (line.startsWith('m=audio')) inAudio = true;
+    if (line.startsWith('m=audio'))                            inAudio = true;
     if (line.startsWith('m=video') || line.startsWith('m=application')) inAudio = false;
     if (inAudio) {
       const m = line.match(/^a=rtpmap:(\d+) opus\/48000/i);
@@ -33,38 +30,34 @@ function patchSDP(sdp) {
     }
   }
 
-  const out   = [];
-  inAudio     = false;
-  let bitrateAdded = false;
+  inAudio = false;
+  const out = [];
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    if (line.startsWith('m=audio'))       inAudio = true;
-    if (line.startsWith('m=video') ||
-        line.startsWith('m=application')) inAudio = false;
-
-    // Add bitrate right after m=audio line
-    if (inAudio && line.startsWith('m=audio')) {
+  for (const line of lines) {
+    if (line.startsWith('m=audio')) {
+      inAudio = true;
       out.push(line);
-      out.push('b=AS:510');        // max audio bitrate 510kbps (like WhatsApp)
-      bitrateAdded = true;
+      out.push('b=AS:128');      // 128kbps — sweet spot for voice quality
       continue;
     }
+    if (line.startsWith('m=video') || line.startsWith('m=application')) {
+      inAudio = false;
+    }
 
-    // Override Opus fmtp line
+    // ✅ MONO Opus — critical for Chrome AEC to work
+    // stereo=0 is REQUIRED — Chrome AEC breaks with stereo
     if (opusPT && line.startsWith(`a=fmtp:${opusPT}`)) {
       out.push(
         `a=fmtp:${opusPT} ` +
         `minptime=10;` +
-        `useinbandfec=1;` +       // forward error correction
-        `usedtx=0;` +             // disable discontinuous transmission for better quality
-        `maxaveragebitrate=510000;` +
+        `useinbandfec=1;` +         // forward error correction
+        `usedtx=1;` +               // save bandwidth in silence
+        `maxaveragebitrate=128000;` +
         `maxplaybackrate=48000;` +
         `sprop-maxcapturerate=48000;` +
-        `stereo=1;` +             // ✅ stereo for better quality
-        `sprop-stereo=1;` +
-        `cbr=0`                   // variable bitrate
+        `stereo=0;` +               // ✅ MONO — AEC requires mono in Chrome
+        `sprop-stereo=0;` +
+        `cbr=0`
       );
       continue;
     }
@@ -76,15 +69,14 @@ function patchSDP(sdp) {
 }
 
 export function useWebRTC(mode = 'video') {
-  const socket   = useRef(null);
-  const pc       = useRef(null);
-  const localRef = useRef(null);
-  const dcRef    = useRef(null);
-  const roomIdR  = useRef(null);
-  const iceBuf   = useRef([]);
-  const rdReady  = useRef(false);
-  // ✅ Single persistent audio element for remote audio
-  const remoteAudioEl = useRef(null);
+  const socket        = useRef(null);
+  const pc            = useRef(null);
+  const localRef      = useRef(null);
+  const dcRef         = useRef(null);
+  const roomIdRef     = useRef(null);
+  const iceBuf        = useRef([]);
+  const rdReady       = useRef(false);
+  const remoteAudioEl = useRef(null);  // single persistent <audio> element
 
   const [localStream,  setLocal]     = useState(null);
   const [remoteStream, setRemote]    = useState(null);
@@ -95,17 +87,24 @@ export function useWebRTC(mode = 'video') {
   const [isCamOff,     setCamOff]    = useState(false);
   const [roomId,       setRoomId]    = useState(null);
 
-  // ✅ Create persistent hidden audio element ONCE on mount
+  // ✅ Create ONE persistent <audio> element at mount — never recreate it
+  // This is critical — browser AEC tracks which audio element plays remote
+  // audio and uses it as the echo reference signal for your mic
   useEffect(() => {
-    const el        = document.createElement('audio');
-    el.autoplay     = true;
-    el.muted        = false;
+    const el         = document.createElement('audio');
+    el.autoplay      = true;
+    el.muted         = false;
+    el.volume        = 1.0;
     el.style.display = 'none';
+    el.id            = 'webrtc-remote-audio';
     document.body.appendChild(el);
     remoteAudioEl.current = el;
 
     return () => {
-      el.srcObject = null;
+      if (el.srcObject) {
+        el.srcObject.getTracks().forEach(t => t.stop());
+        el.srcObject = null;
+      }
       el.remove();
     };
   }, []);
@@ -114,60 +113,69 @@ export function useWebRTC(mode = 'video') {
     setMessages(p => [...p, msg]);
   }, []);
 
-  // ✅ Pure raw constraints — let browser AEC work natively
-  // DO NOT run mic through AudioContext — it breaks browser AEC
+  // ✅ KEY RULES for echo-free audio:
+  // 1. Use MONO (channelCount: 1) — Chrome AEC only works in mono
+  // 2. echoCancellation MUST be true
+  // 3. NEVER process mic through AudioContext before sending
+  // 4. Let browser handle everything natively
   const getMedia = useCallback(async () => {
     if (!navigator.mediaDevices?.getUserMedia) {
-      console.error('getUserMedia not supported');
+      console.error('getUserMedia not supported — need HTTPS');
       return null;
     }
 
     localRef.current?.getTracks().forEach(t => t.stop());
 
-    // Try best quality first
-    const audioConstraints = {
-      echoCancellation:           true,
-      noiseSuppression:           true,
-      autoGainControl:            true,
-      suppressLocalAudioPlayback: true,
-      sampleRate:                 48000,
-      sampleSize:                 16,
-      channelCount:               2,    // stereo mic input
-      latency:                    0,
-      // Chrome-specific advanced constraints
-      googEchoCancellation:       true,
-      googEchoCancellation2:      true,
-      googAutoGainControl:        true,
-      googAutoGainControl2:       true,
-      googNoiseSuppression:       true,
-      googNoiseSuppression2:      true,
-      googHighpassFilter:         true,
-      googAudioMirroring:         false,
-      googNoiseReduction:         true,
-    };
-
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: audioConstraints,
         video: mode === 'video' ? {
-          width:     { ideal: 1280 },
-          height:    { ideal: 720 },
-          frameRate: { ideal: 30 },
+          width:      { ideal: 1280 },
+          height:     { ideal: 720 },
+          frameRate:  { ideal: 30 },
           facingMode: 'user',
         } : false,
+
+        audio: {
+          // ✅ These 3 are the most important
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl:  true,
+
+          // ✅ MONO — absolutely required for Chrome AEC
+          channelCount: 1,
+
+          // ✅ High quality settings
+          sampleRate: 48000,
+          sampleSize: 16,
+          latency:    0,
+
+          // ✅ Chrome-specific — belt and suspenders
+          googEchoCancellation:              true,
+          googEchoCancellation2:             true,
+          googExperimentalEchoCancellation:  true,
+          googAutoGainControl:               true,
+          googAutoGainControl2:              true,
+          googNoiseSuppression:              true,
+          googExperimentalNoiseSuppression:  true,
+          googHighpassFilter:                true,
+          googAudioMirroring:                false,
+        },
       });
+
       localRef.current = stream;
       setLocal(stream);
       return stream;
-    } catch (e1) {
-      console.warn('HD constraints failed, trying fallback:', e1.message);
-      // Fallback — simpler constraints
+
+    } catch (err) {
+      console.warn('Full constraints failed, trying basic:', err.message);
       try {
+        // Fallback — minimal but echo-safe
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: {
             echoCancellation: true,
             noiseSuppression: true,
             autoGainControl:  true,
+            channelCount:     1,     // ✅ still mono
             sampleRate:       48000,
           },
           video: mode === 'video',
@@ -176,18 +184,18 @@ export function useWebRTC(mode = 'video') {
         setLocal(stream);
         return stream;
       } catch (e2) {
-        console.error('All media attempts failed:', e2);
+        console.error('Media failed completely:', e2);
         return null;
       }
     }
   }, [mode]);
 
   const setupDC = useCallback((dc) => {
-    dcRef.current    = dc;
-    dc.onopen        = () => setChatReady(true);
-    dc.onclose       = () => setChatReady(false);
-    dc.onerror       = (e) => console.error('DC error', e);
-    dc.onmessage     = ({ data }) => {
+    dcRef.current = dc;
+    dc.onopen    = () => setChatReady(true);
+    dc.onclose   = () => setChatReady(false);
+    dc.onerror   = e => console.error('DC error', e);
+    dc.onmessage = ({ data }) => {
       try { addMsg({ ...JSON.parse(data), fromMe: false }); }
       catch { addMsg({ text: data, fromMe: false, ts: Date.now() }); }
     };
@@ -217,7 +225,7 @@ export function useWebRTC(mode = 'video') {
     const remote = new MediaStream();
     setRemote(remote);
 
-    // ✅ Attach remote stream to persistent audio element immediately
+    // ✅ Attach to persistent audio element BEFORE tracks arrive
     if (remoteAudioEl.current) {
       remoteAudioEl.current.srcObject = remote;
     }
@@ -234,37 +242,39 @@ export function useWebRTC(mode = 'video') {
     }
 
     conn.onicecandidate = ({ candidate }) => {
-      if (!candidate || !roomIdR.current) return;
-      socket.current?.emit('ice', { roomId: roomIdR.current, candidate });
+      if (!candidate || !roomIdRef.current) return;
+      socket.current?.emit('ice', { roomId: roomIdRef.current, candidate });
     };
 
-    // ✅ Only add truly remote tracks
+    // ✅ Strict filter — never add own tracks to remote stream
     const localTrackIds = new Set(stream.getTracks().map(t => t.id));
-    conn.ontrack = ({ track, streams }) => {
-      if (localTrackIds.has(track.id)) return;
-
-      // Add to remote MediaStream
+    conn.ontrack = ({ track }) => {
+      if (localTrackIds.has(track.id)) {
+        console.warn('Blocked own track from remote stream');
+        return;
+      }
       remote.addTrack(track);
-
-      // ✅ Also keep audio element updated
+      // Refresh srcObject so browser updates AEC reference
       if (remoteAudioEl.current) {
         remoteAudioEl.current.srcObject = remote;
+        remoteAudioEl.current.play().catch(() => {});
       }
     };
 
     conn.onconnectionstatechange = () => {
       const s = conn.connectionState;
-      console.log('[PC]', s);
+      console.log('[PC state]', s);
       if (s === 'connected') {
         setStatus('connected');
-        // ✅ Ensure audio plays after connection
         remoteAudioEl.current?.play().catch(() => {});
       }
-      if (['disconnected','failed','closed'].includes(s)) {
+      if (['disconnected', 'failed', 'closed'].includes(s)) {
         setStatus('idle');
         setRemote(null);
         setChatReady(false);
-        if (remoteAudioEl.current) remoteAudioEl.current.srcObject = null;
+        if (remoteAudioEl.current) {
+          remoteAudioEl.current.srcObject = null;
+        }
       }
     };
 
@@ -282,7 +292,7 @@ export function useWebRTC(mode = 'video') {
     s.on('connect_error', (e) => console.error('❌ Socket:', e.message));
 
     s.on('matched', async ({ roomId: rid, role }) => {
-      roomIdR.current = rid;
+      roomIdRef.current = rid;
       setRoomId(rid);
       setStatus('connecting');
       setMessages([]);
@@ -292,12 +302,12 @@ export function useWebRTC(mode = 'video') {
       if (!conn) return;
 
       if (isOfferer) {
-        const offer  = await conn.createOffer({
-          offerToReceiveAudio: true,
-          offerToReceiveVideo: mode === 'video',
-          voiceActivityDetection: false, // ✅ disable VAD for consistent quality
+        const offer = await conn.createOffer({
+          offerToReceiveAudio:    true,
+          offerToReceiveVideo:    mode === 'video',
+          voiceActivityDetection: true,
         });
-        const sdp    = patchSDP(offer.sdp);
+        const sdp = patchSDP(offer.sdp);
         await conn.setLocalDescription({ type: offer.type, sdp });
         s.emit('offer', { roomId: rid, offer: { type: offer.type, sdp } });
       }
@@ -312,12 +322,12 @@ export function useWebRTC(mode = 'video') {
       rdReady.current = true;
       await flushIce();
       const answer = await pc.current.createAnswer({
-        voiceActivityDetection: false,
+        voiceActivityDetection: true,
       });
-      const aSdp   = patchSDP(answer.sdp);
+      const aSdp = patchSDP(answer.sdp);
       await pc.current.setLocalDescription({ type: answer.type, sdp: aSdp });
       s.emit('answer', {
-        roomId: roomIdR.current,
+        roomId: roomIdRef.current,
         answer: { type: answer.type, sdp: aSdp },
       });
     });
@@ -345,8 +355,10 @@ export function useWebRTC(mode = 'video') {
 
     s.on('peer:left', () => {
       pc.current?.close();
-      pc.current = null; dcRef.current = null;
-      roomIdR.current = null; rdReady.current = false;
+      pc.current      = null;
+      dcRef.current   = null;
+      roomIdRef.current = null;
+      rdReady.current = false;
       iceBuf.current  = [];
       setRoomId(null);
       setStatus('idle');
@@ -370,27 +382,30 @@ export function useWebRTC(mode = 'video') {
     const dc  = dcRef.current;
     if (dc?.readyState === 'open') {
       dc.send(JSON.stringify({ text: msg.text, ts: msg.ts }));
-    } else if (roomIdR.current) {
+    } else if (roomIdRef.current) {
       socket.current?.emit('chat', {
-        roomId: roomIdR.current, text: msg.text,
+        roomId: roomIdRef.current, text: msg.text,
       });
     }
     addMsg(msg);
   }, [addMsg]);
 
-  const findStranger  = useCallback(() => {
+  const findStranger = useCallback(() => {
     setStatus('waiting'); setMessages([]);
     socket.current?.emit('find', { mode });
   }, [mode]);
 
-  const cancelSearch  = useCallback(() => {
-    socket.current?.emit('cancel'); setStatus('idle');
+  const cancelSearch = useCallback(() => {
+    socket.current?.emit('cancel');
+    setStatus('idle');
   }, []);
 
-  const skipStranger  = useCallback(() => {
+  const skipStranger = useCallback(() => {
     pc.current?.close();
-    pc.current = null; dcRef.current = null;
-    roomIdR.current = null; rdReady.current = false;
+    pc.current      = null;
+    dcRef.current   = null;
+    roomIdRef.current = null;
+    rdReady.current = false;
     iceBuf.current  = [];
     setRemote(null); setMessages([]); setChatReady(false);
     if (remoteAudioEl.current) remoteAudioEl.current.srcObject = null;
