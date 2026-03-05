@@ -14,24 +14,21 @@ const cors = require('cors')
 
 const httpsServer = https.createServer({ key, cert }, app);
 
+const allowedOrigin = 'http://192.168.1.36:3000/';
+
 const io = new Server(httpsServer, {
   cors: {
-    origin: ['https://localhost:3000', 'http://localhost:3000'],
+    origin: allowedOrigin,      
     methods: ['GET', 'POST'],
     credentials: true,
   },
 });
 
-const PORT = 3001;
-
-
 app.use(cors({
-  origin: ['https://localhost:3000', 'http://localhost:3000'],
+  origin: allowedOrigin,       
   methods: ['GET', 'POST'],
   credentials: true,
-}))
-
-
+}));
 
 
 
@@ -189,6 +186,8 @@ io.on('connection', socket => {
     leave(socket.id);
   });
 });
+
+const PORT = 3001
 
 httpsServer.listen(PORT, () => {
   console.log(`\n${C.green}${C.bold}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C.reset}`);
