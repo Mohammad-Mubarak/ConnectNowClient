@@ -8,21 +8,20 @@ const ICE_CONFIG = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
   ],
   iceCandidatePoolSize: 10,
   bundlePolicy:  'max-bundle',
   rtcpMuxPolicy: 'require',
 };
 
-// ✅ Patch SDP — force Opus MONO (required for Chrome AEC to work)
+// ✅ Patch SDP — force Opus MONO (Chrome AEC only works in mono) [web:26]
 function patchSDP(sdp) {
-  const lines  = sdp.split('\r\n');
-  let   opusPT = null;
-  let   inAudio = false;
+  const lines = sdp.split('\r\n');
+  let opusPT  = null;
+  let inAudio = false;
 
   for (const line of lines) {
-    if (line.startsWith('m=audio'))                            inAudio = true;
+    if (line.startsWith('m=audio')) inAudio = true;
     if (line.startsWith('m=video') || line.startsWith('m=application')) inAudio = false;
     if (inAudio) {
       const m = line.match(/^a=rtpmap:(\d+) opus\/48000/i);
@@ -37,35 +36,100 @@ function patchSDP(sdp) {
     if (line.startsWith('m=audio')) {
       inAudio = true;
       out.push(line);
-      out.push('b=AS:128');      // 128kbps — sweet spot for voice quality
+      out.push('b=AS:128');
       continue;
     }
     if (line.startsWith('m=video') || line.startsWith('m=application')) {
       inAudio = false;
     }
 
-    // ✅ MONO Opus — critical for Chrome AEC to work
-    // stereo=0 is REQUIRED — Chrome AEC breaks with stereo
     if (opusPT && line.startsWith(`a=fmtp:${opusPT}`)) {
       out.push(
         `a=fmtp:${opusPT} ` +
-        `minptime=10;` +
-        `useinbandfec=1;` +         // forward error correction
-        `usedtx=1;` +               // save bandwidth in silence
-        `maxaveragebitrate=128000;` +
-        `maxplaybackrate=48000;` +
+        `minptime=10;useinbandfec=1;usedtx=1;` +
+        `maxaveragebitrate=128000;maxplaybackrate=48000;` +
         `sprop-maxcapturerate=48000;` +
-        `stereo=0;` +               // ✅ MONO — AEC requires mono in Chrome
-        `sprop-stereo=0;` +
-        `cbr=0`
+        `stereo=0;sprop-stereo=0;cbr=0`  // MONO — required for Chrome AEC
       );
       continue;
     }
-
     out.push(line);
   }
 
   return out.join('\r\n');
+}
+
+// ✅ THE REAL FIX — WebRTC loopback for AEC
+// Chrome won't apply AEC to remote audio unless it goes through
+// a local WebRTC loopback connection. This is the official fix. [web:33][web:40]
+async function createLoopbackStream(inputStream) {
+  return new Promise((resolve, reject) => {
+    try {
+      const AudioCtx  = window.AudioContext || window.webkitAudioContext;
+      const audioCtx  = new AudioCtx({ sampleRate: 48000 });
+
+      // Source from the remote stream
+      const source    = audioCtx.createMediaStreamSource(inputStream);
+
+      // Apply gentle processing
+      const compressor = audioCtx.createDynamicsCompressor();
+      compressor.threshold.value = -30;
+      compressor.knee.value      = 20;
+      compressor.ratio.value     = 8;
+      compressor.attack.value    = 0.005;
+      compressor.release.value   = 0.15;
+
+      const gainNode  = audioCtx.createGain();
+      gainNode.gain.value = 1.0;
+
+      // ✅ Use MediaStreamDestination — NOT audioCtx.destination
+      // This is the key: output goes to a MediaStream, not speakers directly
+      const dest      = audioCtx.createMediaStreamDestination();
+      source.connect(compressor);
+      compressor.connect(gainNode);
+      gainNode.connect(dest);
+
+      // ✅ Loopback: processed stream → local RTCPeerConnection → <audio>
+      // This makes Chrome apply AEC to the output
+      const loopbackPC1 = new RTCPeerConnection();
+      const loopbackPC2 = new RTCPeerConnection();
+
+      loopbackPC1.onicecandidate = e => {
+        if (e.candidate) loopbackPC2.addIceCandidate(e.candidate).catch(() => {});
+      };
+      loopbackPC2.onicecandidate = e => {
+        if (e.candidate) loopbackPC1.addIceCandidate(e.candidate).catch(() => {});
+      };
+
+      // Add processed audio track to loopback
+      dest.stream.getAudioTracks().forEach(t => loopbackPC1.addTrack(t, dest.stream));
+
+      loopbackPC2.ontrack = ({ streams }) => {
+        // This stream now has Chrome AEC applied ✅
+        resolve({
+          stream:     streams[0],
+          cleanup: () => {
+            loopbackPC1.close();
+            loopbackPC2.close();
+            source.disconnect();
+            audioCtx.close();
+          }
+        });
+      };
+
+      // Negotiate the loopback
+      loopbackPC1.createOffer()
+        .then(offer  => loopbackPC1.setLocalDescription(offer))
+        .then(()     => loopbackPC2.setRemoteDescription(loopbackPC1.localDescription))
+        .then(()     => loopbackPC2.createAnswer())
+        .then(answer => loopbackPC2.setLocalDescription(answer))
+        .then(()     => loopbackPC1.setRemoteDescription(loopbackPC2.localDescription))
+        .catch(reject);
+
+    } catch (e) {
+      reject(e);
+    }
+  });
 }
 
 export function useWebRTC(mode = 'video') {
@@ -76,7 +140,8 @@ export function useWebRTC(mode = 'video') {
   const roomIdRef     = useRef(null);
   const iceBuf        = useRef([]);
   const rdReady       = useRef(false);
-  const remoteAudioEl = useRef(null);  // single persistent <audio> element
+  const remoteAudioEl = useRef(null);
+  const loopbackClean = useRef(null);  // cleanup for loopback connection
 
   const [localStream,  setLocal]     = useState(null);
   const [remoteStream, setRemote]    = useState(null);
@@ -87,24 +152,19 @@ export function useWebRTC(mode = 'video') {
   const [isCamOff,     setCamOff]    = useState(false);
   const [roomId,       setRoomId]    = useState(null);
 
-  // ✅ Create ONE persistent <audio> element at mount — never recreate it
-  // This is critical — browser AEC tracks which audio element plays remote
-  // audio and uses it as the echo reference signal for your mic
+  // ✅ Single persistent <audio> element — never recreate
   useEffect(() => {
-    const el         = document.createElement('audio');
-    el.autoplay      = true;
-    el.muted         = false;
-    el.volume        = 1.0;
-    el.style.display = 'none';
-    el.id            = 'webrtc-remote-audio';
+    const el          = document.createElement('audio');
+    el.autoplay       = true;
+    el.muted          = false;
+    el.volume         = 1.0;
+    el.style.display  = 'none';
+    el.setAttribute('playsinline', '');
     document.body.appendChild(el);
     remoteAudioEl.current = el;
 
     return () => {
-      if (el.srcObject) {
-        el.srcObject.getTracks().forEach(t => t.stop());
-        el.srcObject = null;
-      }
+      el.srcObject = null;
       el.remove();
     };
   }, []);
@@ -113,14 +173,11 @@ export function useWebRTC(mode = 'video') {
     setMessages(p => [...p, msg]);
   }, []);
 
-  // ✅ KEY RULES for echo-free audio:
-  // 1. Use MONO (channelCount: 1) — Chrome AEC only works in mono
-  // 2. echoCancellation MUST be true
-  // 3. NEVER process mic through AudioContext before sending
-  // 4. Let browser handle everything natively
+  // ✅ Raw mic — NEVER process through AudioContext before sending
+  // Let browser AEC handle mic natively
   const getMedia = useCallback(async () => {
     if (!navigator.mediaDevices?.getUserMedia) {
-      console.error('getUserMedia not supported — need HTTPS');
+      console.error('getUserMedia not supported');
       return null;
     }
 
@@ -136,29 +193,23 @@ export function useWebRTC(mode = 'video') {
         } : false,
 
         audio: {
-          // ✅ These 3 are the most important
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl:  true,
-
-          // ✅ MONO — absolutely required for Chrome AEC
-          channelCount: 1,
-
-          // ✅ High quality settings
-          sampleRate: 48000,
-          sampleSize: 16,
-          latency:    0,
-
-          // ✅ Chrome-specific — belt and suspenders
-          googEchoCancellation:              true,
-          googEchoCancellation2:             true,
-          googExperimentalEchoCancellation:  true,
-          googAutoGainControl:               true,
-          googAutoGainControl2:              true,
-          googNoiseSuppression:              true,
-          googExperimentalNoiseSuppression:  true,
-          googHighpassFilter:                true,
-          googAudioMirroring:                false,
+          echoCancellation:  true,   // ✅ must be true
+          noiseSuppression:  true,
+          autoGainControl:   true,
+          channelCount:      1,      // ✅ MONO — AEC requires mono
+          sampleRate:        48000,
+          sampleSize:        16,
+          latency:           0,
+          // Chrome-specific
+          googEchoCancellation:             true,
+          googEchoCancellation2:            true,
+          googExperimentalEchoCancellation: true,
+          googAutoGainControl:              true,
+          googAutoGainControl2:             true,
+          googNoiseSuppression:             true,
+          googExperimentalNoiseSuppression: true,
+          googHighpassFilter:               true,
+          googAudioMirroring:               false,
         },
       });
 
@@ -169,13 +220,12 @@ export function useWebRTC(mode = 'video') {
     } catch (err) {
       console.warn('Full constraints failed, trying basic:', err.message);
       try {
-        // Fallback — minimal but echo-safe
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: {
             echoCancellation: true,
             noiseSuppression: true,
             autoGainControl:  true,
-            channelCount:     1,     // ✅ still mono
+            channelCount:     1,
             sampleRate:       48000,
           },
           video: mode === 'video',
@@ -184,11 +234,36 @@ export function useWebRTC(mode = 'video') {
         setLocal(stream);
         return stream;
       } catch (e2) {
-        console.error('Media failed completely:', e2);
+        console.error('All media failed:', e2);
         return null;
       }
     }
   }, [mode]);
+
+  // ✅ Play remote stream through loopback for proper AEC
+  const playRemoteWithAEC = useCallback(async (remoteStream) => {
+    // Cleanup previous loopback
+    if (loopbackClean.current) {
+      loopbackClean.current();
+      loopbackClean.current = null;
+    }
+
+    if (!remoteAudioEl.current) return;
+
+    try {
+      // ✅ Try loopback AEC fix first
+      const { stream: loopbackStream, cleanup } = await createLoopbackStream(remoteStream);
+      loopbackClean.current = cleanup;
+      remoteAudioEl.current.srcObject = loopbackStream;
+      await remoteAudioEl.current.play().catch(() => {});
+      console.log('✅ Remote audio playing with loopback AEC');
+    } catch (e) {
+      // ✅ Fallback — direct play (still better than AudioContext)
+      console.warn('Loopback failed, using direct audio:', e.message);
+      remoteAudioEl.current.srcObject = remoteStream;
+      await remoteAudioEl.current.play().catch(() => {});
+    }
+  }, []);
 
   const setupDC = useCallback((dc) => {
     dcRef.current = dc;
@@ -213,6 +288,7 @@ export function useWebRTC(mode = 'video') {
   const buildPC = useCallback(async (isOfferer) => {
     dcRef.current?.close();
     pc.current?.close();
+    if (loopbackClean.current) { loopbackClean.current(); loopbackClean.current = null; }
     pc.current      = null;
     dcRef.current   = null;
     rdReady.current = false;
@@ -224,11 +300,6 @@ export function useWebRTC(mode = 'video') {
 
     const remote = new MediaStream();
     setRemote(remote);
-
-    // ✅ Attach to persistent audio element BEFORE tracks arrive
-    if (remoteAudioEl.current) {
-      remoteAudioEl.current.srcObject = remote;
-    }
 
     const conn = new RTCPeerConnection(ICE_CONFIG);
     pc.current = conn;
@@ -246,43 +317,42 @@ export function useWebRTC(mode = 'video') {
       socket.current?.emit('ice', { roomId: roomIdRef.current, candidate });
     };
 
-    // ✅ Strict filter — never add own tracks to remote stream
     const localTrackIds = new Set(stream.getTracks().map(t => t.id));
+    let audioTracksReceived = 0;
+
     conn.ontrack = ({ track }) => {
-      if (localTrackIds.has(track.id)) {
-        console.warn('Blocked own track from remote stream');
-        return;
-      }
+      if (localTrackIds.has(track.id)) return;
       remote.addTrack(track);
-      // Refresh srcObject so browser updates AEC reference
-      if (remoteAudioEl.current) {
-        remoteAudioEl.current.srcObject = remote;
-        remoteAudioEl.current.play().catch(() => {});
+
+      // ✅ Once we get audio track, start loopback AEC
+      if (track.kind === 'audio') {
+        audioTracksReceived++;
+        // Small delay to let stream stabilize
+        setTimeout(() => playRemoteWithAEC(remote), 300);
       }
     };
 
     conn.onconnectionstatechange = () => {
       const s = conn.connectionState;
-      console.log('[PC state]', s);
+      console.log('[PC]', s);
       if (s === 'connected') {
         setStatus('connected');
-        remoteAudioEl.current?.play().catch(() => {});
+        // Ensure audio is playing
+        if (remoteAudioEl.current?.paused) {
+          remoteAudioEl.current.play().catch(() => {});
+        }
       }
       if (['disconnected', 'failed', 'closed'].includes(s)) {
         setStatus('idle');
         setRemote(null);
         setChatReady(false);
-        if (remoteAudioEl.current) {
-          remoteAudioEl.current.srcObject = null;
-        }
+        if (loopbackClean.current) { loopbackClean.current(); loopbackClean.current = null; }
+        if (remoteAudioEl.current) remoteAudioEl.current.srcObject = null;
       }
     };
 
-    conn.oniceconnectionstatechange = () =>
-      console.log('[ICE]', conn.iceConnectionState);
-
     return conn;
-  }, [getMedia, setupDC]);
+  }, [getMedia, setupDC, playRemoteWithAEC]);
 
   useEffect(() => {
     const s = io(SOCKET_URL, { transports: ['websocket', 'polling'] });
@@ -296,7 +366,6 @@ export function useWebRTC(mode = 'video') {
       setRoomId(rid);
       setStatus('connecting');
       setMessages([]);
-
       const isOfferer = role === 'offerer';
       const conn = await buildPC(isOfferer);
       if (!conn) return;
@@ -315,28 +384,21 @@ export function useWebRTC(mode = 'video') {
 
     s.on('offer', async ({ offer }) => {
       if (!pc.current) return;
-      const sdp = patchSDP(offer.sdp);
       await pc.current.setRemoteDescription(
-        new RTCSessionDescription({ type: offer.type, sdp })
+        new RTCSessionDescription({ type: offer.type, sdp: patchSDP(offer.sdp) })
       );
       rdReady.current = true;
       await flushIce();
-      const answer = await pc.current.createAnswer({
-        voiceActivityDetection: true,
-      });
-      const aSdp = patchSDP(answer.sdp);
-      await pc.current.setLocalDescription({ type: answer.type, sdp: aSdp });
-      s.emit('answer', {
-        roomId: roomIdRef.current,
-        answer: { type: answer.type, sdp: aSdp },
-      });
+      const answer = await pc.current.createAnswer({ voiceActivityDetection: true });
+      const sdp    = patchSDP(answer.sdp);
+      await pc.current.setLocalDescription({ type: answer.type, sdp });
+      s.emit('answer', { roomId: roomIdRef.current, answer: { type: answer.type, sdp } });
     });
 
     s.on('answer', async ({ answer }) => {
       if (!pc.current) return;
-      const sdp = patchSDP(answer.sdp);
       await pc.current.setRemoteDescription(
-        new RTCSessionDescription({ type: answer.type, sdp })
+        new RTCSessionDescription({ type: answer.type, sdp: patchSDP(answer.sdp) })
       );
       rdReady.current = true;
       await flushIce();
@@ -355,21 +417,19 @@ export function useWebRTC(mode = 'video') {
 
     s.on('peer:left', () => {
       pc.current?.close();
-      pc.current      = null;
-      dcRef.current   = null;
-      roomIdRef.current = null;
-      rdReady.current = false;
-      iceBuf.current  = [];
-      setRoomId(null);
-      setStatus('idle');
-      setRemote(null);
-      setChatReady(false);
+      if (loopbackClean.current) { loopbackClean.current(); loopbackClean.current = null; }
+      pc.current = null; dcRef.current = null;
+      roomIdRef.current = null; rdReady.current = false;
+      iceBuf.current = [];
+      setRoomId(null); setStatus('idle');
+      setRemote(null); setChatReady(false);
       if (remoteAudioEl.current) remoteAudioEl.current.srcObject = null;
     });
 
     return () => {
       s.disconnect();
       pc.current?.close();
+      if (loopbackClean.current) loopbackClean.current();
       localRef.current?.getTracks().forEach(t => t.stop());
     };
   }, [buildPC, flushIce, addMsg, mode]);
@@ -383,9 +443,7 @@ export function useWebRTC(mode = 'video') {
     if (dc?.readyState === 'open') {
       dc.send(JSON.stringify({ text: msg.text, ts: msg.ts }));
     } else if (roomIdRef.current) {
-      socket.current?.emit('chat', {
-        roomId: roomIdRef.current, text: msg.text,
-      });
+      socket.current?.emit('chat', { roomId: roomIdRef.current, text: msg.text });
     }
     addMsg(msg);
   }, [addMsg]);
@@ -396,17 +454,15 @@ export function useWebRTC(mode = 'video') {
   }, [mode]);
 
   const cancelSearch = useCallback(() => {
-    socket.current?.emit('cancel');
-    setStatus('idle');
+    socket.current?.emit('cancel'); setStatus('idle');
   }, []);
 
   const skipStranger = useCallback(() => {
     pc.current?.close();
-    pc.current      = null;
-    dcRef.current   = null;
-    roomIdRef.current = null;
-    rdReady.current = false;
-    iceBuf.current  = [];
+    if (loopbackClean.current) { loopbackClean.current(); loopbackClean.current = null; }
+    pc.current = null; dcRef.current = null;
+    roomIdRef.current = null; rdReady.current = false;
+    iceBuf.current = [];
     setRemote(null); setMessages([]); setChatReady(false);
     if (remoteAudioEl.current) remoteAudioEl.current.srcObject = null;
     socket.current?.emit('skip', { mode });
@@ -414,14 +470,12 @@ export function useWebRTC(mode = 'video') {
   }, [mode]);
 
   const toggleMute = useCallback(() => {
-    localRef.current?.getAudioTracks()
-      .forEach(t => { t.enabled = !t.enabled; });
+    localRef.current?.getAudioTracks().forEach(t => { t.enabled = !t.enabled; });
     setMuted(p => !p);
   }, []);
 
   const toggleCamera = useCallback(() => {
-    localRef.current?.getVideoTracks()
-      .forEach(t => { t.enabled = !t.enabled; });
+    localRef.current?.getVideoTracks().forEach(t => { t.enabled = !t.enabled; });
     setCamOff(p => !p);
   }, []);
 
