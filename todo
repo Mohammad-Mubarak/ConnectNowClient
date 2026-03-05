@@ -1,0 +1,19 @@
+// --------------Here's the updated Navbar with UserMenu integrated — clean and simple:----------
+
+// components/Navbar.jsx
+
+// What to Replace When Your Auth is Ready
+// js
+// // Line 14-21 — swap MOCK_USER and MOCK_GEO with your real data:
+
+// // Option A: Context
+// const { user, geo } = useAuthContext()
+
+// // Option B: Props from layout
+// // Pass user/geo as props into Navbar
+
+// // Option C: SWR/fetch
+// const { data } = useSWR('/api/profile', fetcher)
+// const user = data?.user
+// const geo  = data?.geo
+// That's it — everything else stays exactly the same.
