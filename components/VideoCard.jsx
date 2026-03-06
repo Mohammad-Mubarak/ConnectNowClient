@@ -231,14 +231,30 @@
 //   )
 // }
 
-
-
 'use client'
 import { useEffect, useRef, useState } from 'react'
 import {
   Camera, CameraOff, Mic, MicOff,
   Maximize2, Users, Radio, Waves, Signal
 } from 'lucide-react'
+
+// ── Export this and use it wherever you call getUserMedia ──────────────────────
+export function getOptimalAudioConstraints() {
+  return {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl:  true,
+    sampleRate:       48000,
+    channelCount:     1,
+  }
+}
+
+// Usage in your page/hook:
+// const stream = await navigator.mediaDevices.getUserMedia({
+//   audio: getOptimalAudioConstraints(),
+//   video: true,  // or false for audio-only
+// })
+
 
 // ── Waveform ──────────────────────────────────────────────────────────────────
 function LiveWaveform({ stream, color = '#2dd4bf', barCount = 28 }) {
@@ -247,12 +263,19 @@ function LiveWaveform({ stream, color = '#2dd4bf', barCount = 28 }) {
 
   useEffect(() => {
     if (!stream) { setBars(new Array(barCount).fill(2)); return }
-    const ctx      = new (window.AudioContext || window.webkitAudioContext)()
+
+    let ctx
+    try {
+      ctx = new (window.AudioContext || window.webkitAudioContext)()
+    } catch (e) {
+      return
+    }
+
     const source   = ctx.createMediaStreamSource(stream)
     const analyser = ctx.createAnalyser()
     analyser.fftSize               = 512
     analyser.smoothingTimeConstant = 0.85
-    source.connect(analyser) // ✅ NEVER to destination
+    source.connect(analyser) // ✅ NEVER connect to ctx.destination
 
     const data = new Uint8Array(analyser.frequencyBinCount)
     const tick = () => {
@@ -280,10 +303,12 @@ function LiveWaveform({ stream, color = '#2dd4bf', barCount = 28 }) {
       animRef.current = requestAnimationFrame(tick)
     }
     animRef.current = requestAnimationFrame(tick)
+
     return () => {
       cancelAnimationFrame(animRef.current)
       try { source.disconnect() } catch (_) {}
-      ctx.close()
+      // Suspend instead of close to avoid "AudioContext is closed" errors on re-mount
+      ctx.state !== 'closed' && ctx.close()
     }
   }, [stream, barCount])
 
@@ -313,6 +338,7 @@ function LiveWaveform({ stream, color = '#2dd4bf', barCount = 28 }) {
   )
 }
 
+
 // ── Ripple Rings ──────────────────────────────────────────────────────────────
 function RippleRings({ color, active, count = 4, base = 92 }) {
   return (
@@ -340,6 +366,7 @@ function RippleRings({ color, active, count = 4, base = 92 }) {
   )
 }
 
+
 // ── VideoCard ─────────────────────────────────────────────────────────────────
 export default function VideoCard({
   label,
@@ -350,19 +377,36 @@ export default function VideoCard({
   isMuted     = false,
   isCamOff    = false,
 }) {
-  const videoRef = useRef(null)
-  const isAudio  = mode === 'audio'
-  const teal     = '#2dd4bf'
-  const violet   = '#a78bfa'
-  const color    = isYou ? teal : violet
+  const videoRef    = useRef(null)
+  const isAudio     = mode === 'audio'
+  const teal        = '#2dd4bf'
+  const violet      = '#a78bfa'
+  const color       = isYou ? teal : violet
 
-  // ✅ PDF fix: local muted+vol=0, stranger vol=0.9
+  // ── Track-level echo cancellation status (dynamic, not hardcoded) ──────────
+  const [ecStatus, setEcStatus] = useState('ec:?')
+
   useEffect(() => {
-    if (!videoRef.current || !stream) return
-    videoRef.current.srcObject = stream
-    videoRef.current.muted     = isYou
-    videoRef.current.volume    = isYou ? 0 : 0.9
+    if (!stream) { setEcStatus('ec:off'); return }
+    const audioTrack = stream.getAudioTracks()[0]
+    if (!audioTrack) { setEcStatus('ec:off'); return }
+    try {
+      const settings = audioTrack.getSettings()
+      setEcStatus(settings.echoCancellation ? 'ec:on' : 'ec:off')
+    } catch (_) {
+      setEcStatus('ec:?')
+    }
+  }, [stream])
+
+  // ── Video element: mute local, play remote ─────────────────────────────────
+  useEffect(() => {
+    const el = videoRef.current
+    if (!el || !stream) return
+    el.srcObject = stream
+    el.muted     = isYou        // ✅ mute local to prevent mic→speaker→mic loop
+    el.volume    = isYou ? 0 : 0.9
   }, [stream, isYou])
+
 
   return (
     <div
@@ -399,6 +443,7 @@ export default function VideoCard({
           background: `radial-gradient(circle,${color}0e 0%,transparent 70%)`,
         }}
       />
+
 
       {/* ════════ AUDIO MODE ════════ */}
       {isAudio && (
@@ -544,31 +589,31 @@ export default function VideoCard({
                     :           '[ awaiting peer ]'}
                 </p>
 
-                {/* ✅ Free floating waveform — no box */}
                 <LiveWaveform stream={stream} color={color} barCount={28} />
               </div>
             )}
           </div>
 
-          {/* Bottom bar */}
+          {/* Bottom bar — ec status now DYNAMIC from track settings */}
           <div className="w-full flex items-center justify-between">
             <div className="flex items-center gap-1.5">
               <Signal size={11} style={{ color: `${color}50` }} />
               <span className="text-[10px] font-mono" style={{ color: `${color}45` }}>
-                {isYou ? 'opus · 48k · ec:on' : stream ? 'p2p · webrtc' : 'standby'}
+                {isYou ? `opus · 48k · ${ecStatus}` : stream ? 'p2p · webrtc' : 'standby'}
               </span>
             </div>
             {isYou && !isMuted && (
               <div className="flex items-center gap-1.5">
                 <Waves size={10} style={{ color: `${color}60` }} />
                 <span className="text-[10px] font-mono" style={{ color: `${color}45` }}>
-                  aec active
+                  {ecStatus === 'ec:on' ? 'aec active' : 'aec inactive'}
                 </span>
               </div>
             )}
           </div>
         </div>
       )}
+
 
       {/* ════════ VIDEO MODE ════════ */}
       {!isAudio && (

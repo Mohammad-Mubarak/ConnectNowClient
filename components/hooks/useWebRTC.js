@@ -6,14 +6,12 @@ const SOCKET_URL = 'https://connectnow-ctcz.onrender.com';
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
-  // ── Your ExpressTurn (primary TURN) ──
   { urls: 'stun:free.expressturn.com:3478' },
   {
     urls: 'turn:free.expressturn.com:3478?transport=tcp',
     username: '000000002088091354',
     credential: 'gUixIGLNMG5XEn07oaVVF0vHNKk=',
   },
-  // ── freestun (confirmed working, no expiry) ──
   {
     urls: ['turn:freestun.net:3478', 'turn:freestun.net:3479'],
     username: 'free',
@@ -24,7 +22,6 @@ const ICE_SERVERS = [
     username: 'free',
     credential: 'free',
   },
-  // ── openrelay.metered.ca (confirmed working, multiple transports) ──
   {
     urls: 'turn:openrelay.metered.ca:80',
     username: 'openrelayproject',
@@ -53,7 +50,6 @@ function buildICEConfig(forceRelay = false) {
     iceCandidatePoolSize: 10,
     bundlePolicy: 'max-bundle',
     rtcpMuxPolicy: 'require',
-    // 'relay' forces all traffic through TURN — use only as fallback
     iceTransportPolicy: forceRelay ? 'relay' : 'all',
   };
 }
@@ -96,18 +92,21 @@ function patchSDP(sdp) {
 }
 
 export function useWebRTC(mode = 'video') {
-  const socket    = useRef(null);
-  const pc        = useRef(null);
-  const localRef  = useRef(null);
-  const dcRef     = useRef(null);
-  const roomIdRef = useRef(null);
-  const iceBuf    = useRef([]);
-  const rdReady   = useRef(false);
-  const audioElRef = useRef(null);
+  const socket       = useRef(null);
+  const pc           = useRef(null);
+  const localRef     = useRef(null);
+  const dcRef        = useRef(null);
+  const roomIdRef    = useRef(null);
+  const iceBuf       = useRef([]);
+  const rdReady      = useRef(false);
+  const audioElRef   = useRef(null);
+  const isOffererRef = useRef(false);
+  const iceRetryDone = useRef(false);
+  const iceRestartTimer = useRef(null); // ✅ FIX #2: debounce ICE restart
 
-  // ── NEW: track role + ICE retry state ──
-  const isOffererRef  = useRef(false);
-  const iceRetryDone  = useRef(false);   // only retry once per session
+  // ── Stable ref for mode so socket listeners don't re-register ──────────────
+  const modeRef = useRef(mode);
+  useEffect(() => { modeRef.current = mode; }, [mode]);
 
   const [localStream,  setLocal]     = useState(null);
   const [remoteStream, setRemote]    = useState(null);
@@ -118,7 +117,7 @@ export function useWebRTC(mode = 'video') {
   const [isCamOff,     setCamOff]    = useState(false);
   const [roomId,       setRoomId]    = useState(null);
 
-  // Persistent hidden audio element (audio mode)
+  // ── Persistent hidden audio element (audio mode) ───────────────────────────
   useEffect(() => {
     document.getElementById('__rtc_audio')?.remove();
     const el = document.createElement('audio');
@@ -134,14 +133,22 @@ export function useWebRTC(mode = 'video') {
 
   const addMsg = useCallback((msg) => setMessages(p => [...p, msg]), []);
 
+  // ✅ FIX #5: pause before nulling srcObject to avoid AbortError
+  const stopAudio = useCallback(() => {
+    const el = audioElRef.current;
+    if (!el) return;
+    try { el.pause(); } catch (_) {}
+    el.srcObject = null;
+  }, []);
+
   const playRemoteAudio = useCallback((stream) => {
     const el = audioElRef.current;
-    if (!el || mode !== 'audio') return;
+    if (!el || modeRef.current !== 'audio') return;
     el.srcObject = stream;
     el.muted = false;
     el.volume = 0.9;
     el.play().catch(e => console.warn('Audio play:', e));
-  }, [mode]);
+  }, []);
 
   const getMedia = useCallback(async () => {
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -151,14 +158,17 @@ export function useWebRTC(mode = 'video') {
     localRef.current?.getTracks().forEach(t => t.stop());
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: mode === 'video' ? {
+        video: modeRef.current === 'video' ? {
           width: { ideal: 1280 }, height: { ideal: 720 },
           frameRate: { ideal: 30 }, facingMode: 'user',
         } : false,
         audio: {
-          echoCancellation: true, noiseSuppression: true,
-          autoGainControl: true, channelCount: 1,
-          sampleRate: 48000, sampleSize: 16,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl:  true,
+          channelCount:     1,
+          sampleRate:       48000,
+          sampleSize:       16,
         },
       });
       localRef.current = stream;
@@ -169,14 +179,14 @@ export function useWebRTC(mode = 'video') {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-          video: mode === 'video',
+          video: modeRef.current === 'video',
         });
         localRef.current = stream;
         setLocal(stream);
         return stream;
       } catch (e) { console.error('Media failed:', e); return null; }
     }
-  }, [mode]);
+  }, []); // ✅ FIX #6: no `mode` dep — use modeRef instead
 
   const setupDC = useCallback((dc) => {
     dcRef.current = dc;
@@ -189,17 +199,22 @@ export function useWebRTC(mode = 'video') {
     };
   }, [addMsg]);
 
-  const flushIce = useCallback(async () => {
-    if (!pc.current) return;
-    for (const c of iceBuf.current) {
-      try { await pc.current.addIceCandidate(new RTCIceCandidate(c)); }
-      catch (e) { console.warn('ICE flush err:', e); }
-    }
+  // ✅ FIX #3: unified ICE drain helper
+  const drainICE = useCallback(async () => {
+    if (!pc.current || iceBuf.current.length === 0) return;
+    const buf = [...iceBuf.current];
     iceBuf.current = [];
+    for (const c of buf) {
+      try { await pc.current.addIceCandidate(new RTCIceCandidate(c)); }
+      catch (e) { console.warn('ICE drain err:', e); }
+    }
   }, []);
 
-  // ─── buildPC: accepts forceRelay for TURN-only fallback ──────────────────
-  const buildPC = useCallback(async (isOfferer, forceRelay = false) => {
+  // ── buildPC — uses a ref to avoid circular useCallback deps ───────────────
+  const buildPCRef = useRef(null);
+
+  buildPCRef.current = async (isOfferer, forceRelay = false) => {
+    clearTimeout(iceRestartTimer.current);
     dcRef.current?.close();
     pc.current?.close();
     pc.current = null; dcRef.current = null;
@@ -233,7 +248,7 @@ export function useWebRTC(mode = 'video') {
     conn.ontrack = ({ track }) => {
       if (localIds.has(track.id)) return;
       remote.addTrack(track);
-      if (track.kind === 'audio' && mode === 'audio') playRemoteAudio(remote);
+      if (track.kind === 'audio' && modeRef.current === 'audio') playRemoteAudio(remote);
     };
 
     conn.onconnectionstatechange = () => {
@@ -241,8 +256,7 @@ export function useWebRTC(mode = 'video') {
       console.log('[PC STATE]', s);
       if (s === 'connected') {
         setStatus('connected');
-        iceRetryDone.current = false; // reset for next session
-        // Log which relay was actually used
+        iceRetryDone.current = false;
         conn.getStats().then(stats => {
           stats.forEach(r => {
             if (r.type === 'candidate-pair' && r.state === 'succeeded') {
@@ -250,42 +264,49 @@ export function useWebRTC(mode = 'video') {
             }
           });
         });
-        if (mode === 'audio') playRemoteAudio(remote);
+        if (modeRef.current === 'audio') playRemoteAudio(remote);
       }
       if (['disconnected', 'failed', 'closed'].includes(s)) {
         setStatus('idle'); setRemote(null); setChatReady(false);
-        if (audioElRef.current) audioElRef.current.srcObject = null;
+        stopAudio(); // ✅ FIX #5
       }
     };
 
-    // ─── KEY FIX: ICE state machine with retry + restart ─────────────────
+    // ✅ FIX #2: wait 3s on 'disconnected' before ICE restart (not immediately)
     conn.oniceconnectionstatechange = async () => {
       const state = conn.iceConnectionState;
       console.log('[ICE STATE]', state);
 
-      // 1️⃣ Transient drop → try ICE restart first (cheap, no renegotiation)
       if (state === 'disconnected' && isOffererRef.current && conn === pc.current) {
-        console.warn('[ICE] ⚠️ Disconnected — attempting ICE restart...');
-        try {
-          const offer = await conn.createOffer({ iceRestart: true });
-          await conn.setLocalDescription(offer);
-          socket.current?.emit('offer', {
-            roomId: roomIdRef.current,
-            offer: { type: offer.type, sdp: patchSDP(offer.sdp) },
-          });
-        } catch (e) { console.warn('[ICE] Restart failed:', e); }
+        clearTimeout(iceRestartTimer.current);
+        iceRestartTimer.current = setTimeout(async () => {
+          if (!pc.current || pc.current.iceConnectionState !== 'disconnected') return;
+          console.warn('[ICE] ⚠️ Disconnected 3s — attempting ICE restart...');
+          try {
+            const offer = await conn.createOffer({ iceRestart: true });
+            await conn.setLocalDescription(offer);
+            socket.current?.emit('offer', {
+              roomId: roomIdRef.current,
+              offer: { type: offer.type, sdp: patchSDP(offer.sdp) },
+            });
+          } catch (e) { console.warn('[ICE] Restart failed:', e); }
+        }, 3000); // [web:17] best practice: don't wait for 'failed' (30s timeout)
       }
 
-      // 2️⃣ Hard failure → rebuild PC with relay-only (force TURN)
+      if (state === 'connected' || state === 'completed') {
+        clearTimeout(iceRestartTimer.current); // cancel pending restart if recovered
+      }
+
       if (state === 'failed' && !iceRetryDone.current && roomIdRef.current) {
         iceRetryDone.current = true;
+        clearTimeout(iceRestartTimer.current);
         console.warn('[ICE] ❌ ICE failed — rebuilding with forced TURN relay...');
-        const newConn = await buildPC(isOffererRef.current, true);
+        const newConn = await buildPCRef.current(isOffererRef.current, true); // ✅ FIX #4: use ref, not self
         if (!newConn || !isOffererRef.current) return;
         try {
           const offer = await newConn.createOffer({
             offerToReceiveAudio: true,
-            offerToReceiveVideo: mode === 'video',
+            offerToReceiveVideo: modeRef.current === 'video',
             voiceActivityDetection: true,
           });
           const sdp = patchSDP(offer.sdp);
@@ -299,7 +320,17 @@ export function useWebRTC(mode = 'video') {
     };
 
     return conn;
-  }, [getMedia, setupDC, mode, playRemoteAudio]);
+  };
+
+  // ── Stable wrapper so socket listeners never need to re-register ───────────
+  const buildPC = useCallback(
+    (isOfferer, forceRelay = false) => buildPCRef.current(isOfferer, forceRelay),
+    []
+  ); // ✅ FIX #7: empty deps — stable reference
+
+  useEffect(() => {
+    getMedia(); // ✅ FIX #6: only called once, on mount
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     const s = io(SOCKET_URL, {
@@ -316,8 +347,8 @@ export function useWebRTC(mode = 'video') {
     s.on('connect_error', e  => console.error('❌ Socket error:', e.message));
 
     s.on('matched', async ({ roomId: rid, role }) => {
-      roomIdRef.current  = rid;
-      isOffererRef.current = role === 'offerer'; // ✅ track role for retry
+      roomIdRef.current    = rid;
+      isOffererRef.current = role === 'offerer';
       iceRetryDone.current = false;
       setRoomId(rid);
       setStatus('connecting');
@@ -329,7 +360,7 @@ export function useWebRTC(mode = 'video') {
       if (role === 'offerer') {
         const offer = await conn.createOffer({
           offerToReceiveAudio: true,
-          offerToReceiveVideo: mode === 'video',
+          offerToReceiveVideo: modeRef.current === 'video',
           voiceActivityDetection: true,
         });
         const sdp = patchSDP(offer.sdp);
@@ -344,7 +375,7 @@ export function useWebRTC(mode = 'video') {
         new RTCSessionDescription({ type: offer.type, sdp: patchSDP(offer.sdp) })
       );
       rdReady.current = true;
-      await flushIce();
+      await drainICE(); // ✅ FIX #3
       const answer = await pc.current.createAnswer({ voiceActivityDetection: true });
       const sdp = patchSDP(answer.sdp);
       await pc.current.setLocalDescription({ type: answer.type, sdp });
@@ -357,12 +388,15 @@ export function useWebRTC(mode = 'video') {
         new RTCSessionDescription({ type: answer.type, sdp: patchSDP(answer.sdp) })
       );
       rdReady.current = true;
-      await flushIce();
+      await drainICE(); // ✅ FIX #3
     });
 
     s.on('ice', async ({ candidate }) => {
       if (!pc.current) return;
-      if (!rdReady.current) { iceBuf.current.push(candidate); return; }
+      if (!rdReady.current) {
+        iceBuf.current.push(candidate); // buffer until SRD is done
+        return;
+      }
       try { await pc.current.addIceCandidate(new RTCIceCandidate(candidate)); }
       catch (e) { console.warn('[ICE add err]', e); }
     });
@@ -371,22 +405,22 @@ export function useWebRTC(mode = 'video') {
     s.on('waiting',   () => setStatus('waiting'));
     s.on('cancelled', () => setStatus('idle'));
     s.on('peer:left', () => {
+      clearTimeout(iceRestartTimer.current);
       pc.current?.close();
       pc.current = null; dcRef.current = null;
       roomIdRef.current = null; rdReady.current = false;
       iceRetryDone.current = false; iceBuf.current = [];
       setRoomId(null); setStatus('idle'); setRemote(null); setChatReady(false);
-      if (audioElRef.current) audioElRef.current.srcObject = null;
+      stopAudio(); // ✅ FIX #5
     });
 
     return () => {
+      clearTimeout(iceRestartTimer.current);
       s.disconnect();
       pc.current?.close();
       localRef.current?.getTracks().forEach(t => t.stop());
     };
-  }, [buildPC, flushIce, addMsg, mode]);
-
-  useEffect(() => { getMedia(); }, [getMedia]);
+  }, [buildPC, drainICE, addMsg, stopAudio]); // ✅ FIX #7: all stable — won't re-run
 
   const sendMessage = useCallback((text) => {
     if (!text.trim()) return;
@@ -402,22 +436,24 @@ export function useWebRTC(mode = 'video') {
 
   const findStranger = useCallback(() => {
     setStatus('waiting'); setMessages([]);
-    socket.current?.emit('find', { mode });
-  }, [mode]);
+    socket.current?.emit('find', { mode: modeRef.current });
+  }, []);
 
   const cancelSearch = useCallback(() => {
     socket.current?.emit('cancel'); setStatus('idle');
   }, []);
 
   const skipStranger = useCallback(() => {
+    clearTimeout(iceRestartTimer.current);
     pc.current?.close();
     pc.current = null; dcRef.current = null;
     roomIdRef.current = null; rdReady.current = false;
     iceRetryDone.current = false; iceBuf.current = [];
     setRemote(null); setMessages([]); setChatReady(false);
-    if (audioElRef.current) audioElRef.current.srcObject = null;
-    socket.current?.emit('skip', { mode }); setStatus('waiting');
-  }, [mode]);
+    stopAudio(); // ✅ FIX #5
+    socket.current?.emit('skip', { mode: modeRef.current });
+    setStatus('waiting');
+  }, [stopAudio]);
 
   const toggleMute = useCallback(() => {
     localRef.current?.getAudioTracks().forEach(t => { t.enabled = !t.enabled; });
